@@ -1,0 +1,11 @@
+uvicorn
+fastapi
+tiktoken
+deep_translator
+supabase
+supabase-auth
+supabase-functions
+httpx
+langdetect
+fish-audio-sdk
+openai
