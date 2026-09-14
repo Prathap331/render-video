@@ -9,3 +9,4 @@ httpx
 langdetect
 fish-audio-sdk
 openai
+whisperx
