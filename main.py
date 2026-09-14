@@ -15,7 +15,10 @@ from fastapi import HTTPException
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import datetime
+from dotenv import load_dotenv
 
+
+load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -51,7 +54,6 @@ _MOTION_TYPE_LIST = ["zoom_in", "zoom_out", "pan_left", "pan_right", "tilt_up", 
 _VALID_MOTION_TYPES = set(_MOTION_TYPE_LIST)
 _DEFAULT_MOTION_TYPE = "zoom_in"
 
-
 TIMELINE_WIDTH = int(os.getenv("TIMELINE_WIDTH", "1920"))
 TIMELINE_HEIGHT = int(os.getenv("TIMELINE_HEIGHT", "1080"))
 
@@ -74,7 +76,6 @@ FFMPEG_X264_FLAGS = [
     "-pix_fmt", "yuv420p",
     "-threads", "0",
 ]
-
 
 CANVAS_WIDTH = 1920
 CANVAS_HEIGHT = 1080

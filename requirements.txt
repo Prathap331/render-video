@@ -10,3 +10,4 @@ langdetect
 fish-audio-sdk
 openai
 whisperx
+python-dotenv
