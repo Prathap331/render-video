@@ -1818,9 +1818,7 @@ def _content_aware_max_box_size(display_text: Any) -> tuple:
     return max_width, max_height
 
 
-def _validate_geometry_px(
-    raw: Any, category: str, allow_manual_placement: bool = False, display_text: Any = None,
-) -> dict:
+def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> dict:
     if category in ("full_screen", "transition"):
         return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
 
@@ -1830,8 +1828,8 @@ def _validate_geometry_px(
     else:
         try:
             geo = {
-                "x": int(raw.get("x", 0)) if allow_manual_placement else 0,
-                "y": int(raw.get("y", 0)) if allow_manual_placement else 0,
+                "x": int(raw.get("x", 0)),
+                "y": int(raw.get("y", 0)),
                 "width": int(raw.get("width", default["width"])),
                 "height": int(raw.get("height", default["height"])),
             }
@@ -1847,33 +1845,19 @@ def _validate_geometry_px(
     geo["width"] = max(40, min(geo["width"], max_width))
     geo["height"] = max(40, min(geo["height"], max_height))
 
-    if allow_manual_placement and isinstance(raw, dict) and ("x" in raw or "y" in raw):
-        geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
-        geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
-        if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
-            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
-                geo["y"] = CAPTION_SAFE_ZONE_Y - geo["height"]
-            else:
-                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
-                geo["y"] = _SAFE_MARGIN
-        return geo
-
-    geo["x"] = (ANIMATION_CANVAS_WIDTH - geo["width"]) // 2
-
-    if category in ("overlay_text", "overlay_graphic"):
-        centered_y = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
-        if centered_y + geo["height"] > CAPTION_SAFE_ZONE_Y:
-            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
-                centered_y = CAPTION_SAFE_ZONE_Y - geo["height"]
-            else:
-                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
-                centered_y = _SAFE_MARGIN
-        geo["y"] = centered_y
-    else:
-        geo["y"] = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
+    # Always honor the given x/y — just clamp to safe margins and keep
+    # overlay_text/overlay_graphic clear of the caption band. No more
+    # forced re-centering based on category or a "manually placed" flag.
+    geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
+    geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
+    if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
+        if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
+            geo["y"] = CAPTION_SAFE_ZONE_Y - geo["height"]
+        else:
+            geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
+            geo["y"] = _SAFE_MARGIN
 
     return geo
-
 
 
 def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
