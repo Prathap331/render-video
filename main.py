@@ -1046,21 +1046,49 @@ def _build_icon_overlay_drawtext(
     return ",".join(filters)
 
 
-    
+
+_PLACEMENT_TO_DRAWTEXT_XY = {
+    "top_left":      lambda m: (f"{m}",              f"{m}"),
+    "top_center":    lambda m: ("(w-text_w)/2",       f"{m}"),
+    "top_right":     lambda m: (f"w-text_w-{m}",      f"{m}"),
+    "center_left":   lambda m: (f"{m}",              "(h-text_h)/2"),
+    "center":        lambda m: ("(w-text_w)/2",       "(h-text_h)/2"),
+    "center_right":  lambda m: (f"w-text_w-{m}",      "(h-text_h)/2"),
+    "bottom_left":   lambda m: (f"{m}",              f"h-text_h-{m}"),
+    "bottom_center": lambda m: ("(w-text_w)/2",       f"h-text_h-{m}"),
+    "bottom_right":  lambda m: (f"w-text_w-{m}",      f"h-text_h-{m}"),
+    "full_frame":    lambda m: ("(w-text_w)/2",       "(h-text_h)/2"),
+}
+
+
+def _wrap_text_for_drawtext(text: str, max_chars_per_line: int) -> str:
+    words = text.split()
+    lines = []
+    current: list[str] = []
+    current_len = 0
+    for w in words:
+        add_len = len(w) + (1 if current else 0)
+        if current and current_len + add_len > max_chars_per_line:
+            lines.append(" ".join(current))
+            current = [w]
+            current_len = len(w)
+        else:
+            current.append(w)
+            current_len += add_len
+    if current:
+        lines.append(" ".join(current))
+    return "\n".join(lines)
+
+
 def _build_beat_animation_drawtext(
     animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
     offset_seconds: float = 0.0,
 ) -> Optional[str]:
     text = _display_text_to_string(animation.get("display_text"))
     if not text and animation.get("highlight_target_text"):
-        # No real screenshot asset to composite — degrade to showing the
-        # quoted text itself rather than dropping the beat's emphasis.
         text = animation["highlight_target_text"]
     if not text:
         return None
-
-    geo = _scale_geometry_px(animation.get("geometry_px") or {}, out_width, out_height)
-    font_size = animation.get("font_size") or _font_size_for_geometry(geo, text)
 
     duration_seconds = max(clip_duration_frames / fps, 0.2)
     fade_in = min(0.4, duration_seconds / 4)
@@ -1072,6 +1100,64 @@ def _build_beat_animation_drawtext(
         f"if(gt(t,{o + duration_seconds - fade_out}),({o + duration_seconds}-t)/{fade_out},1)))"
     )
 
+    category = animation.get("category")
+    is_full_screen = category in ("full_screen", "transition")
+    raw_geo = animation.get("geometry_px") or {}
+    is_untouched_full_canvas = (
+        is_full_screen
+        and raw_geo.get("x", 0) == 0
+        and raw_geo.get("y", 0) == 0
+        and raw_geo.get("width") == ANIMATION_CANVAS_WIDTH
+        and raw_geo.get("height") == ANIMATION_CANVAS_HEIGHT
+    )
+
+    if is_untouched_full_canvas:
+        # FIX: this used to draw literally at geo x/y (0,0 for an
+        # untouched full-screen card, since that box is the whole-canvas
+        # default meant for Remotion's flex centering) — pinning text to
+        # the raw top-left corner. Now: when no one has dragged this card
+        # to a custom position, honor `placement` (the same 9-slot grid
+        # Remotion's own components use) instead of hardcoding a single
+        # position. This is NOT a forced center — placement defaults to
+        # "center" only if the card itself was never given a placement
+        # either; any other placement value renders there.
+        placement = animation.get("placement") or "center"
+        font_size = animation.get("font_size") or max(28, min(int(out_height * 0.055), 64))
+        max_chars_per_line = max(20, int(out_width * 0.6 / (font_size * 0.55)))
+        wrapped = _wrap_text_for_drawtext(text, max_chars_per_line)
+        safe_text = _escape_drawtext(wrapped)
+
+        margin = 80
+        xy_fn = _PLACEMENT_TO_DRAWTEXT_XY.get(placement, _PLACEMENT_TO_DRAWTEXT_XY["center"])
+        x_expr, y_expr = xy_fn(margin)
+
+        return (
+            f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
+            f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.6)}:boxborderw=24:line_spacing=12:"
+            f"x={x_expr}:y={y_expr}:alpha='{alpha_expr}'"
+        )
+
+    if is_full_screen:
+        # A full_screen card whose geometry_px has actually been dragged
+        # away from the default full-canvas box — honor that literal x/y
+        # like any other overlay, same as the non-full_screen branch
+        # below. No centering here either: wherever it was dropped is
+        # where it draws.
+        geo = _scale_geometry_px(raw_geo, out_width, out_height)
+        font_size = animation.get("font_size") or max(28, min(int(geo["height"] * 0.4), 64))
+        max_chars_per_line = max(20, int(geo["width"] * 0.9 / (font_size * 0.55)))
+        wrapped = _wrap_text_for_drawtext(text, max_chars_per_line)
+        safe_text = _escape_drawtext(wrapped)
+        x = f"{geo['x']:.1f}"
+        y = f"{geo['y']:.1f}"
+        return (
+            f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
+            f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.6)}:boxborderw=24:line_spacing=12:"
+            f"x={x}:y={y}:alpha='{alpha_expr}'"
+        )
+
+    geo = _scale_geometry_px(animation.get("geometry_px") or {}, out_width, out_height)
+    font_size = animation.get("font_size") or _font_size_for_geometry(geo, text)
     safe_text = _escape_drawtext(text)
     x = f"{geo['x']:.1f}"
     y = f"{geo['y']:.1f}"
@@ -1081,7 +1167,7 @@ def _build_beat_animation_drawtext(
         f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.55)}:boxborderw=16:line_spacing=8:"
         f"x={x}:y={y}:alpha='{alpha_expr}'"
     )
-
+    
 
 def _build_remotion_props(animation_type: str, animation: dict, width: int, height: int) -> dict:
 
