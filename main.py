@@ -1,4 +1,3 @@
-
 from fastapi import HTTPException
 import os
 import asyncio
@@ -709,11 +708,6 @@ async def render_infographic_via_remotion(
             )
             max_frame = int(m.group(2)) if m else None
             if max_frame is None:
-                # Couldn't parse a specific bound from the error — try a
-                # single generic retry with no --frames constraint at all
-                # (let the composition use its own default length) rather
-                # than giving up outright. If this also fails, there's
-                # nothing more to try.
                 print(f"[render] '{composition_id}' render failed and error format wasn't recognized ({e}) — retrying with the composition's own default duration")
                 try:
                     await _run(_build_cmd(None), cwd=REMOTION_PROJECT_DIR)
@@ -733,14 +727,6 @@ async def render_infographic_via_remotion(
     if not rendered:
         return None
 
-    # Unconditional check: does the actual rendered file have as many
-    # frames as requested? If not — for ANY reason, error-message-parsed
-    # or not — freeze-pad its last frame out to duration_frames so the
-    # overlay stays visible for its full intended duration rather than
-    # vanishing early (the render pipeline composites this clip starting
-    # at frame 0 of wherever it's placed, so a short clip directly means
-    # early disappearance, independent of how correct the upstream
-    # anchor_start_sec/anchor_end_sec computation was).
     try:
         actual_seconds = await _probe_duration_seconds(out_path)
         actual_frames = max(1, round(actual_seconds * fps))
@@ -1112,15 +1098,6 @@ def _build_beat_animation_drawtext(
     )
 
     if is_untouched_full_canvas:
-        # FIX: this used to draw literally at geo x/y (0,0 for an
-        # untouched full-screen card, since that box is the whole-canvas
-        # default meant for Remotion's flex centering) — pinning text to
-        # the raw top-left corner. Now: when no one has dragged this card
-        # to a custom position, honor `placement` (the same 9-slot grid
-        # Remotion's own components use) instead of hardcoding a single
-        # position. This is NOT a forced center — placement defaults to
-        # "center" only if the card itself was never given a placement
-        # either; any other placement value renders there.
         placement = animation.get("placement") or "center"
         font_size = animation.get("font_size") or max(28, min(int(out_height * 0.055), 64))
         max_chars_per_line = max(20, int(out_width * 0.6 / (font_size * 0.55)))
@@ -1138,11 +1115,6 @@ def _build_beat_animation_drawtext(
         )
 
     if is_full_screen:
-        # A full_screen card whose geometry_px has actually been dragged
-        # away from the default full-canvas box — honor that literal x/y
-        # like any other overlay, same as the non-full_screen branch
-        # below. No centering here either: wherever it was dropped is
-        # where it draws.
         geo = _scale_geometry_px(raw_geo, out_width, out_height)
         font_size = animation.get("font_size") or max(28, min(int(geo["height"] * 0.4), 64))
         max_chars_per_line = max(20, int(geo["width"] * 0.9 / (font_size * 0.55)))
@@ -1263,9 +1235,6 @@ async def _apply_beat_animation(
     duration_frames = animation.get("duration_frames") or fps * 2
     offset_seconds = max(0.0, offset_seconds)
 
-    # A separate async Remotion pipeline may already have pre-rendered
-    # this animation and populated `asset_url` on the timeline track —
-    # use it directly instead of invoking Remotion synchronously again.
     asset_url = animation.get("asset_url")
     overlay_clip = None
 
@@ -1289,9 +1258,6 @@ async def _apply_beat_animation(
                 duration_frames=duration_frames, fps=fps, width=width, height=height, tmp_dir=tmp_dir,
             )
         else:
-            # No composition built for this animation_type yet — don't
-            # even spawn `npx remotion render`, it can only fail. Fall
-            # straight through to the text/skip logic below.
             print(
                 f"[render] no Remotion composition mapped for animation_type "
                 f"'{animation_type}' yet (see _REMOTION_COMPOSITION_BY_ANIMATION_TYPE) "
@@ -1300,12 +1266,6 @@ async def _apply_beat_animation(
 
     if overlay_clip:
         composited = os.path.join(tmp_dir, f"anim_composited_{uuid.uuid4().hex}.mp4")
-        # -itsoffset on the overlay INPUT shifts its presentation
-        # timestamps forward by offset_seconds, so it has no frames to
-        # show until that point in the merged timeline — before then,
-        # overlay just passes the base beat clip through unchanged. This
-        # is what actually delays the animation to its real anchor time
-        # instead of always starting at the beat's own frame 0.
         cmd = [
             FFMPEG_BIN, "-y",
             "-i", beat_clip_path,
@@ -1339,8 +1299,6 @@ async def _apply_beat_animation(
                 print(f"[render] FFmpeg text-overlay fallback for '{animation_type}' failed: {e}")
         return beat_clip_path
 
-    # --- ICON FIX: overlay_graphic/branding used to just fall through to
-    # "return beat_clip_path" below with no FFmpeg rendering at all.
     icon_eligible = category in ("overlay_graphic", "branding")
     if icon_eligible:
         icon_drawtext = _build_icon_overlay_drawtext(animation, width, height, duration_frames, fps, offset_seconds)
@@ -1457,7 +1415,7 @@ async def _render_scene(
                     if a_start_frame is None or a_end_frame is None:
                         continue
                     if a_end_frame <= track_start_frame or a_start_frame >= track_end_frame:
-                        continue  # no overlap with this beat at all
+                        continue
                     relevant_animations.append((a_start_frame, anim))
                 relevant_animations.sort(key=lambda pair: pair[0])
 
@@ -1484,9 +1442,6 @@ async def _render_scene(
 
             base_clip = await _lock_clip_to_frame_count(base_clip, duration_frames, fps, width, height, tmp_dir)
         else:
-            # Legacy fallback: no beat tracks at all for this scene (older
-            # timeline_json predating the beats refactor). No beat-level
-            # animation to apply here since there's no beat to key it by.
             selected, source = None, None
             media = scene.get("media") or {}
             video_candidates = (media.get("videos") or {}).get("results") or []
@@ -1855,9 +1810,9 @@ def _find_phrase_span_sec(
 
     n_target = len(target_words)
     min_run = min(n_target, 3)
-    min_ratio = 0.6 if n_target >= 5 else 1.0  # short phrases still need a near-exact hit
+    min_ratio = 0.6 if n_target >= 5 else 1.0
 
-    candidates = []  # every qualifying (score, offset) pair, not just the best
+    candidates = []
     best_score = None
     for offset in range(-n_target, n):
         matches = 0
@@ -1945,16 +1900,12 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
             geo = None
 
     if category in ("full_screen", "transition"):
-        # FIX: this used to unconditionally return the full-canvas box,
-        # discarding any dragged/reposition geometry_px the user set for
-        # a full-screen card. Now: if a real geometry_px was stored
-        # (i.e. the user actually repositioned it), honor it like any
-        # other category; only fall back to full-canvas when nothing
-        # was ever set, so untouched scenes still render exactly as
-        # before.
+        # If a real geometry_px was stored (i.e. the user actually
+        # repositioned it), honor it like any other category; only fall
+        # back to full-canvas when nothing was ever set, so untouched
+        # scenes still render exactly as before.
         if geo is None:
             return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
-        # still clamp to the canvas so a bad drag can't push the card off-frame
         geo["width"] = max(80, min(geo["width"], ANIMATION_CANVAS_WIDTH))
         geo["height"] = max(80, min(geo["height"], ANIMATION_CANVAS_HEIGHT))
         geo["x"] = max(0, min(geo["x"], ANIMATION_CANVAS_WIDTH - geo["width"]))
