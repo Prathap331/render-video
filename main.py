@@ -1818,6 +1818,7 @@ def _content_aware_max_box_size(display_text: Any) -> tuple:
     return max_width, max_height
 
 
+
 def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> dict:
     if category in ("full_screen", "transition"):
         return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
@@ -1845,9 +1846,11 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
     geo["width"] = max(40, min(geo["width"], max_width))
     geo["height"] = max(40, min(geo["height"], max_height))
 
-    # Always honor the given x/y — just clamp to safe margins and keep
-    # overlay_text/overlay_graphic clear of the caption band. No more
-    # forced re-centering based on category or a "manually placed" flag.
+    # Always honor the given x/y — clamp to safe margins and keep
+    # overlay_text/overlay_graphic clear of the caption band, but never
+    # force-override the position back to center. Whatever geometry_px
+    # is stored (from the model, a fallback builder, or a human PATCH
+    # reposition) is what renders.
     geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
     geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
     if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
@@ -1891,9 +1894,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 continue
             w_start_frame = scene_start_frame + _seconds_to_frames(w["start"] - start_sec, fps)
             w_end_frame = scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps)
-            # Defensive clamp: WhisperX timestamps can round to a frame or
-            # two past the scene's own computed end — never let a caption
-            # word render past the scene/voiceover boundary.
             w_start_frame = max(scene_start_frame, min(w_start_frame, scene_end_frame))
             w_end_frame = max(w_start_frame, min(w_end_frame, scene_end_frame))
             words.append({"word": w.get("word", ""), "startFrame": w_start_frame, "endFrame": w_end_frame})
@@ -2024,7 +2024,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
 
             safe_geometry_px = _validate_geometry_px(
                 animation.get("geometry_px"), animation.get("category"),
-                allow_manual_placement=bool(animation.get("manually_placed")),
                 display_text=animation.get("display_text"),
             )
 
@@ -2064,8 +2063,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
         "resolution": {"width": TIMELINE_WIDTH, "height": TIMELINE_HEIGHT},
         "tracks": tracks,
     }
-
-
 
 def _slim_selected_asset(selected: Optional[dict]) -> Optional[dict]:
     if not selected:
