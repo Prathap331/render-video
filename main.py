@@ -29,9 +29,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 origins = [
-    "http://localhost:3000",
-    "https://www.testing.storio.tech",
-    "https://testing.storio.tech",
+    "*"
 ]
 
 app.add_middleware(
@@ -129,8 +127,6 @@ _REMOTION_COMPOSITION_BY_ANIMATION_TYPE = {
 
 REMOTION_MAX_CONCURRENT = int(os.getenv("REMOTION_MAX_CONCURRENT", "2"))
 _remotion_semaphore = asyncio.Semaphore(REMOTION_MAX_CONCURRENT)
-
-
 
 def _ease_expr(duration_frames: int) -> str:
     d = max(duration_frames - 1, 1)
@@ -1098,22 +1094,49 @@ def _build_remotion_props(animation_type: str, animation: dict, width: int, heig
     elif not isinstance(icons, list):
         icons = []
 
+    geometry_px = animation.get("geometry_px")
+    placement = animation.get("placement")
+
+    def _with_common(props: dict, include_geometry: bool = True, include_placement: bool = True) -> dict:
+        if include_geometry and geometry_px:
+            props["geometryPx"] = _scale_geometry_px(geometry_px, width, height)
+        if include_placement and placement:
+            props["placement"] = placement
+        if animation.get("text_animation_style"):
+            props["text_animation_style"] = animation["text_animation_style"]
+        return props
+
     if animation_type == "full_screen_title_card":
-        return {"title": lines[0] if lines else text, "subtitle": lines[1] if len(lines) > 1 else ""}
+        return _with_common({
+            "title": lines[0] if lines else text,
+            "subtitle": lines[1] if len(lines) > 1 else "",
+        })
 
     if animation_type == "full_screen_quote_card":
         quote = lines[0] if lines else (animation.get("highlight_target_text") or text)
-        return {"quote": quote, "attribution": lines[1] if len(lines) > 1 else ""}
+        return _with_common({
+            "quote": quote,
+            "attribution": lines[1] if len(lines) > 1 else "",
+        })
 
     if animation_type == "full_screen_data_viz":
-        return {"label": lines[0] if lines else text, "caption": lines[1] if len(lines) > 1 else ""}
+        return _with_common({
+            "label": lines[0] if lines else text,
+            "caption": lines[1] if len(lines) > 1 else "",
+        })
 
     if animation_type == "stat_counter_overlay":
-        return {"value": lines[0] if lines else text, "label": lines[1] if len(lines) > 1 else ""}
+        return _with_common({
+            "value": lines[0] if lines else text,
+            "label": lines[1] if len(lines) > 1 else "",
+        })
 
     if animation_type == "bullet_list_reveal":
         items = lines if lines else ([text] if text else ["", ""])
-        return {"title": "", "items": items[:6] or ["", ""]}
+        return _with_common({
+            "title": "",
+            "items": items[:6] or ["", ""],
+        })
 
     if animation_type == "icon_sequence":
         return {
@@ -1820,12 +1843,10 @@ def _content_aware_max_box_size(display_text: Any) -> tuple:
 
 
 def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> dict:
-    if category in ("full_screen", "transition"):
-        return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
-
     default = {"width": 520, "height": 160}
+
     if not isinstance(raw, dict):
-        geo = {"x": 0, "y": 0, **default}
+        geo = None
     else:
         try:
             geo = {
@@ -1835,7 +1856,27 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
                 "height": int(raw.get("height", default["height"])),
             }
         except (TypeError, ValueError):
-            geo = {"x": 0, "y": 0, **default}
+            geo = None
+
+    if category in ("full_screen", "transition"):
+        # FIX: this used to unconditionally return the full-canvas box,
+        # discarding any dragged/reposition geometry_px the user set for
+        # a full-screen card. Now: if a real geometry_px was stored
+        # (i.e. the user actually repositioned it), honor it like any
+        # other category; only fall back to full-canvas when nothing
+        # was ever set, so untouched scenes still render exactly as
+        # before.
+        if geo is None:
+            return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
+        # still clamp to the canvas so a bad drag can't push the card off-frame
+        geo["width"] = max(80, min(geo["width"], ANIMATION_CANVAS_WIDTH))
+        geo["height"] = max(80, min(geo["height"], ANIMATION_CANVAS_HEIGHT))
+        geo["x"] = max(0, min(geo["x"], ANIMATION_CANVAS_WIDTH - geo["width"]))
+        geo["y"] = max(0, min(geo["y"], ANIMATION_CANVAS_HEIGHT - geo["height"]))
+        return geo
+
+    if geo is None:
+        geo = {"x": 0, "y": 0, **default}
 
     max_width = max(40, ANIMATION_CANVAS_WIDTH - 2 * _SAFE_MARGIN)
     max_height = max(40, ANIMATION_CANVAS_HEIGHT - 2 * _SAFE_MARGIN)
@@ -1846,11 +1887,6 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
     geo["width"] = max(40, min(geo["width"], max_width))
     geo["height"] = max(40, min(geo["height"], max_height))
 
-    # Always honor the given x/y — clamp to safe margins and keep
-    # overlay_text/overlay_graphic clear of the caption band, but never
-    # force-override the position back to center. Whatever geometry_px
-    # is stored (from the model, a fallback builder, or a human PATCH
-    # reposition) is what renders.
     geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
     geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
     if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
@@ -1861,7 +1897,6 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
             geo["y"] = _SAFE_MARGIN
 
     return geo
-
 
 def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
     tracks = []
