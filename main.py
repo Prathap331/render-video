@@ -828,18 +828,19 @@ Style: Caption,{font_family},{font_size},{primary_color},{outline_color},&H80000
 [Events]
 Format: Layer, Start, End, Style, Text
 """
-    if animation_type == "static_line" and words:
-        start_frame = words[0]["startFrame"] - scene_start_frame
-        end_frame = words[-1]["endFrame"] - scene_start_frame
-        text = " ".join(w["word"] for w in words)
-        if start_frame < 0:
-            start_frame = 0
-        if end_frame > start_frame:
-            start_ts = _frames_to_ass_time(start_frame, fps)
-            end_ts = _frames_to_ass_time(end_frame, fps)
-            return header + f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}\n"
-        return header
-
+    # FIX: "static_line" used to be special-cased here to dump EVERY word
+    # in the scene into a single Dialogue event spanning the scene's
+    # entire start-to-end duration — meant for a short static caption,
+    # this became a wall of overlapping, un-chunked text for anything
+    # longer (a full 260-280 word scene rendered as one continuous
+    # on-screen block for ~100+ seconds — the bug reported in chat).
+    # None of the 4 animation_type values (kinetic_caption, static_line,
+    # typewriter, word_pop) actually render differently from each other
+    # in this ASS builder — there's no real per-type visual distinction
+    # implemented here at all, just this one broken special case. So
+    # static_line now falls through to the same chunked-by-words_per_line
+    # path every other style already uses correctly, instead of bypassing
+    # chunking entirely.
     lines = []
     chunk: list[dict] = []
     CHUNK_SIZE = style.get("words_per_line") or CAPTION_WORDS_PER_LINE
@@ -2218,6 +2219,39 @@ def _compute_broll_list(timeline: dict) -> list:
         for t in timeline.get("tracks", []) if t.get("type") == "broll"
     ]
 
+def _expire_stale_batches(batches: list[dict], now: datetime.datetime) -> list[dict]:
+    active = []
+    for b in batches:
+        try:
+            expires_at = datetime.datetime.fromisoformat(b["expires_at"])
+        except Exception:
+            continue
+        if expires_at > now:
+            active.append(b)
+    return active
+
+
+def _sum_batches(batches: list[dict]) -> int:
+    return sum(int(b.get("remaining", 0)) for b in batches)
+
+
+def _deduct_from_batches(batches: list[dict], amount: int) -> tuple[list[dict], int]:
+    if _sum_batches(batches) < amount:
+        return batches, 0
+
+    sorted_batches = sorted(batches, key=lambda b: b["expires_at"])
+    remaining_to_deduct = amount
+    updated = []
+    for b in sorted_batches:
+        b = dict(b)
+        if remaining_to_deduct > 0:
+            take = min(b["remaining"], remaining_to_deduct)
+            b["remaining"] -= take
+            remaining_to_deduct -= take
+        if b["remaining"] > 0:
+            updated.append(b)
+
+    return updated, amount
 
 @app.post("/render/{video_id}")
 async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoRequest()):
@@ -2246,6 +2280,39 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     user_id = row.data.get("user_id")
     if not user_id:
         raise HTTPException(status_code=400, detail="Video has no associated user")
+
+    # --- Deduct 50 credits for this render, same batch logic as /unlock ---
+    RENDER_CREDIT_COST = 50
+    try:
+        profile_res = supabase.table('user_profiles') \
+            .select('id, credit_batches') \
+            .eq('id', user_id) \
+            .maybe_single() \
+            .execute()
+
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="user profile not found")
+
+        batches = profile_res.data.get('credit_batches') or []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        active_batches = _expire_stale_batches(batches, now)
+
+        updated_batches, deducted = _deduct_from_batches(active_batches, RENDER_CREDIT_COST)
+        if deducted == 0:
+            raise HTTPException(status_code=402, detail="credits not sufficient")
+
+        new_total = _sum_batches(updated_batches)
+
+        supabase.table('user_profiles').update({
+            'credit_batches': updated_batches,
+            'credits_remaining': new_total,
+        }).eq('id', user_id).execute()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[render] failed to deduct credits for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="failed to deduct credits")
 
     timeline = build_timeline_from_scenes(scenes)
     try:
