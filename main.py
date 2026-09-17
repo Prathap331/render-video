@@ -1185,9 +1185,19 @@ def _build_remotion_props(animation_type: str, animation: dict, width: int, heig
         })
 
     if animation_type == "stat_counter_overlay":
+        # FIX: StatCounterOverlay only ever renders `value` (big number)
+        # and `label` (one line below it) — but the Animation Planner can
+        # legitimately produce more than 2 lines of display_text (e.g. a
+        # 3-item list like ["weights", "biases", "activation function"]
+        # for a "levers of the network" beat). Previously anything past
+        # lines[1] was silently dropped — never rendered anywhere, no
+        # error, no indication it happened. Now: everything after the
+        # first line is joined into the single `label` field, so extra
+        # items still show up (as part of a richer label) instead of
+        # vanishing.
         return _with_common({
             "value": lines[0] if lines else text,
-            "label": lines[1] if len(lines) > 1 else "",
+            "label": " · ".join(lines[1:]) if len(lines) > 1 else "",
         })
 
     if animation_type == "bullet_list_reveal":
