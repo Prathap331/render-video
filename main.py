@@ -828,19 +828,6 @@ Style: Caption,{font_family},{font_size},{primary_color},{outline_color},&H80000
 [Events]
 Format: Layer, Start, End, Style, Text
 """
-    # FIX: "static_line" used to be special-cased here to dump EVERY word
-    # in the scene into a single Dialogue event spanning the scene's
-    # entire start-to-end duration — meant for a short static caption,
-    # this became a wall of overlapping, un-chunked text for anything
-    # longer (a full 260-280 word scene rendered as one continuous
-    # on-screen block for ~100+ seconds — the bug reported in chat).
-    # None of the 4 animation_type values (kinetic_caption, static_line,
-    # typewriter, word_pop) actually render differently from each other
-    # in this ASS builder — there's no real per-type visual distinction
-    # implemented here at all, just this one broken special case. So
-    # static_line now falls through to the same chunked-by-words_per_line
-    # path every other style already uses correctly, instead of bypassing
-    # chunking entirely.
     lines = []
     chunk: list[dict] = []
     CHUNK_SIZE = style.get("words_per_line") or CAPTION_WORDS_PER_LINE
@@ -1185,16 +1172,6 @@ def _build_remotion_props(animation_type: str, animation: dict, width: int, heig
         })
 
     if animation_type == "stat_counter_overlay":
-        # FIX: StatCounterOverlay only ever renders `value` (big number)
-        # and `label` (one line below it) — but the Animation Planner can
-        # legitimately produce more than 2 lines of display_text (e.g. a
-        # 3-item list like ["weights", "biases", "activation function"]
-        # for a "levers of the network" beat). Previously anything past
-        # lines[1] was silently dropped — never rendered anywhere, no
-        # error, no indication it happened. Now: everything after the
-        # first line is joined into the single `label` field, so extra
-        # items still show up (as part of a richer label) instead of
-        # vanishing.
         return _with_common({
             "value": lines[0] if lines else text,
             "label": " · ".join(lines[1:]) if len(lines) > 1 else "",
@@ -1479,7 +1456,19 @@ async def _render_scene(
         timeline_caption = (caption_tracks_by_scene or {}).get(scene_id)
         caption_style = (timeline_caption or {}).get("style") or scene.get("caption_style")
 
-        words = scene.get("word_segments") or []
+        # FIX (captions missing from rendered video): this was reading
+        # scene.get("word_segments"), which is now deliberately [] for
+        # non-English scenes — real transcription no longer runs on that
+        # audio (see edit_video_service.py's non-English render path). The
+        # actual caption source for BOTH English (real WhisperX words) and
+        # non-English (beat-interpolated English translation) scenes is
+        # scene["caption_word_segments_en"], set by /edit-video's
+        # _process_scene. This function ignored timeline_caption's own
+        # "words" list too (only ever used it for "style") — reading
+        # straight from the scene dict directly is simpler and correct
+        # either way, since raw_scenes (what "scene" is here) already
+        # carries caption_word_segments_en from /edit-video.
+        words = scene.get("caption_word_segments_en") or []
         words = [
             w for w in words
             if "start" in w and "end" in w
@@ -1911,10 +1900,6 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
             geo = None
 
     if category in ("full_screen", "transition"):
-        # If a real geometry_px was stored (i.e. the user actually
-        # repositioned it), honor it like any other category; only fall
-        # back to full-canvas when nothing was ever set, so untouched
-        # scenes still render exactly as before.
         if geo is None:
             return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
         geo["width"] = max(80, min(geo["width"], ANIMATION_CANVAS_WIDTH))
@@ -1969,7 +1954,17 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "scene_start_sec": start_sec, "scene_end_sec": end_sec,
             })
 
-        word_segments = scene.get("word_segments") or []
+        # FIX (captions missing from rendered video — see chat): this was
+        # scene.get("word_segments"), which is now deliberately [] for
+        # non-English scenes (no real transcription runs on that audio
+        # anymore). Real caption words for BOTH English and non-English
+        # scenes live in scene["caption_word_segments_en"], set by
+        # /edit-video's _process_scene — this just wasn't reading from it.
+        # This is a second, independent copy of the same stale-field bug
+        # already fixed in edit_video_service.py's own build_timeline_
+        # from_scenes; the two files each keep their own copy of this
+        # function, so both needed the same fix.
+        word_segments = scene.get("caption_word_segments_en") or []
         timed_words_sec = [w for w in word_segments if "start" in w and "end" in w]
         words = []
         for w in word_segments:
