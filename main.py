@@ -1357,6 +1357,7 @@ async def _render_scene(
     timeline_tracks_by_scene: Optional[dict] = None,
     caption_tracks_by_scene: Optional[dict] = None,
     animation_tracks_by_scene_beat: Optional[dict] = None,
+    scene_start_frame_by_scene: Optional[dict] = None,
 ) -> str:
     async with semaphore:
         scene_id = scene.get("scene_id", uuid.uuid4().hex)
@@ -1476,22 +1477,27 @@ async def _render_scene(
 
         current = base_clip
 
+        # FIX: caption words were being pulled from scene.get("word_segments"),
+        # a field that never exists on scene objects — real word-level timing
+        # only lives on the "caption_word" timeline track, as absolute
+        # (whole-video) frame numbers. We now read from that track and
+        # convert those absolute frames into frames relative to this scene's
+        # clip using the scene's global start frame (sourced from its
+        # audio track), instead of silently ending up with an empty word
+        # list and no captions burned.
         timeline_caption = (caption_tracks_by_scene or {}).get(scene_id)
         caption_style = (timeline_caption or {}).get("style") or scene.get("caption_style")
 
-        words = scene.get("word_segments") or []
-        words = [
-            w for w in words
-            if "start" in w and "end" in w
-            and w["start"] >= start_sec and w["end"] <= end_sec
-        ]
+        scene_global_start_frame = (scene_start_frame_by_scene or {}).get(scene_id, 0)
+        raw_words = (timeline_caption or {}).get("words") or []
         frame_words = [
             {
                 "word": w.get("word", ""),
-                "startFrame": max(round((w["start"] - start_sec) * fps), 0),
-                "endFrame": max(round((w["end"] - start_sec) * fps), 0),
+                "startFrame": max(w["startFrame"] - scene_global_start_frame, 0),
+                "endFrame": max(w["endFrame"] - scene_global_start_frame, 0),
             }
-            for w in words
+            for w in raw_words
+            if "startFrame" in w and "endFrame" in w
         ]
         current = await _burn_captions(
             current, frame_words, 0, fps, width, height, tmp_dir, style=caption_style
@@ -1561,7 +1567,6 @@ async def _render_scene(
 
         return final_scene_path
 
-
 async def _concat_scenes(scene_paths: list[str], work_root: str, fps: int = TIMELINE_FPS) -> str:
     list_path = os.path.join(work_root, "concat_list.txt")
     with open(list_path, "w") as f:
@@ -1616,6 +1621,7 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
     animation_tracks_by_scene_beat = {}
+    scene_start_frame_by_scene = {}
     for track in timeline.get("tracks", []):
         if track.get("type") == "broll" and track.get("scene_id"):
             timeline_tracks_by_scene.setdefault(track["scene_id"], []).append(track)
@@ -1623,6 +1629,11 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
             caption_tracks_by_scene[track["scene_id"]] = track
         elif track.get("type") == "animation" and track.get("scene_id"):
             animation_tracks_by_scene_beat.setdefault(track["scene_id"], {})[track.get("beat_id")] = track
+        elif track.get("type") == "audio" and track.get("scene_id"):
+            # FIX: needed to convert this scene's caption_word words (which
+            # are stored as absolute/whole-video frame numbers) into frames
+            # relative to the scene's own clip when burning captions.
+            scene_start_frame_by_scene[track["scene_id"]] = track.get("startFrame", 0)
 
     for beat_tracks in timeline_tracks_by_scene.values():
         beat_tracks.sort(key=lambda t: t.get("startFrame", 0))
@@ -1646,6 +1657,7 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
                         timeline_tracks_by_scene=timeline_tracks_by_scene,
                         caption_tracks_by_scene=caption_tracks_by_scene,
                         animation_tracks_by_scene_beat=animation_tracks_by_scene_beat,
+                        scene_start_frame_by_scene=scene_start_frame_by_scene,
                     )
                     return scene_id, path, None
                 except Exception as e:
@@ -1726,8 +1738,6 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
         raise HTTPException(status_code=500, detail=f"Render failed: {e}")
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
-
-
 
 
 def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
