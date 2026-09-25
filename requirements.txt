@@ -1,0 +1,6 @@
+uvicorn
+fastapi
+supabase
+supabase-auth
+supabase-functions
+python-dotenv
