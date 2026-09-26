@@ -84,6 +84,56 @@ def _download(url: str, dest_path: str) -> str:
     return dest_path
 
 
+def _normalize_video(src_path: str, dest_path: str):
+    """
+    Convert downloaded B-roll into a browser/Remotion-friendly MP4.
+
+    Output:
+    - H.264
+    - yuv420p
+    - 1920x1080
+    - 30 FPS
+    - faststart
+    - no audio
+    """
+
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+    _run([
+        "ffmpeg",
+        "-y",
+        "-i", src_path,
+
+        # Make every video the same size as the Remotion composition.
+        "-vf",
+        (
+            "scale=1920:1080:"
+            "force_original_aspect_ratio=increase,"
+            "crop=1920:1080,"
+            "setsar=1,"
+            "fps=30"
+        ),
+
+        # Browser-friendly video.
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+
+        # Important for Chromium/Remotion compatibility.
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "main",
+        "-level:v", "4.1",
+
+        # Put MP4 metadata at the beginning.
+        "-movflags", "+faststart",
+
+        # B-roll doesn't need its source audio.
+        "-an",
+
+        dest_path,
+    ])
+
+
 def _ext_from_url(url: str, default: str) -> str:
     tail = url.split("?")[0]
     if "." in tail.rsplit("/", 1)[-1]:
@@ -91,34 +141,161 @@ def _ext_from_url(url: str, default: str) -> str:
     return default
 
 
-def _pick_asset(direction: dict, tmp_dir: str):
-    asserts = direction.get("asserts") or {}
-    videos = asserts.get("videos") or []
-    photos = asserts.get("photos") or []
+def _pick_asset(direction: dict, video_id: str):
+
+    assets = direction.get("asserts") or {}
+
+    videos = assets.get("videos") or []
+    photos = assets.get("photos") or []
+
+    asset_dir = os.path.join(
+        REMOTION_PROJECT_DIR,
+        "public",
+        "render-assets",
+        video_id,
+    )
+
+    os.makedirs(asset_dir, exist_ok=True)
+
+    # =========================================================
+    # PREFER VIDEO
+    # =========================================================
 
     if videos:
-        v = videos[0]
-        url = v["video_url"]
+
+        video = videos[0]
+
+        url = video["video_url"]
+
         ext = _ext_from_url(url, "mp4")
-        path = os.path.join(tmp_dir, "assets", f"video_{v['id']}.{ext}")
+
+        # Original downloaded file.
+        source_filename = (
+            f"video_{video['id']}_source.{ext}"
+        )
+
+        source_path = os.path.join(
+            asset_dir,
+            source_filename,
+        )
+
+        # Final normalized file that Remotion will use.
+        final_filename = (
+            f"video_{video['id']}.mp4"
+        )
+
+        final_path = os.path.join(
+            asset_dir,
+            final_filename,
+        )
+
         try:
-            _download(url, path)
-            return "video", path
+
+            # -------------------------------------------------
+            # DOWNLOAD ORIGINAL
+            # -------------------------------------------------
+
+            _download(
+                url,
+                source_path,
+            )
+
+            # -------------------------------------------------
+            # NORMALIZE FOR REMOTION
+            # -------------------------------------------------
+
+            # Always normalize the source.
+            #
+            # This is intentional because an old final MP4
+            # may already exist and may be the problematic file.
+            _normalize_video(
+                source_path,
+                final_path,
+            )
+
+            if not os.path.exists(final_path):
+                raise RuntimeError(
+                    f"Normalized video was not created: "
+                    f"{final_path}"
+                )
+
+            print(
+                f"[video] normalized: "
+                f"{source_path} -> {final_path}"
+            )
+
+            return {
+                "kind": "video",
+                "path": (
+                    f"render-assets/"
+                    f"{video_id}/"
+                    f"{final_filename}"
+                ),
+            }
+
         except Exception as e:
-            print(f"[warn] video download failed ({url}): {e}")
+
+            print(
+                f"[warn] video processing failed "
+                f"({url}): {e}"
+            )
+
+            # If normalization failed, remove the broken
+            # output so Remotion never receives it.
+            if os.path.exists(final_path):
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+
+    # =========================================================
+    # OTHERWISE IMAGE
+    # =========================================================
 
     if photos:
-        p = photos[0]
-        url = p["image_url"]
-        ext = _ext_from_url(url, "jpg")
-        path = os.path.join(tmp_dir, "assets", f"photo_{p['id']}.{ext}")
-        try:
-            _download(url, path)
-            return "photo", path
-        except Exception as e:
-            print(f"[warn] photo download failed ({url}): {e}")
 
-    return None, None
+        photo = photos[0]
+
+        url = photo["image_url"]
+
+        ext = _ext_from_url(
+            url,
+            "jpg",
+        )
+
+        filename = (
+            f"photo_{photo['id']}.{ext}"
+        )
+
+        local_path = os.path.join(
+            asset_dir,
+            filename,
+        )
+
+        try:
+
+            _download(
+                url,
+                local_path,
+            )
+
+            return {
+                "kind": "photo",
+                "path": (
+                    f"render-assets/"
+                    f"{video_id}/"
+                    f"{filename}"
+                ),
+            }
+
+        except Exception as e:
+
+            print(
+                f"[warn] photo download failed "
+                f"({url}): {e}"
+            )
+
+    return None
 
 
 def to_frames(seconds: float) -> int:
@@ -151,46 +328,128 @@ def _resolve_template_image(direction: dict, props: dict):
         props["image_url"] = photos[0].get("image_url", "")
 
 
-def normalize_scene(scene: dict, scene_offset_frames: int, tmp_dir: str) -> dict:
+def normalize_scene(
+    scene: dict,
+    scene_offset_frames: int,
+    video_id: str,
+) -> dict:
+
     words = scene.get("word_timestamps", [])
-    scene_duration_frames = to_frames(words[-1]["end"]) if words else 0
+
+    scene_duration_frames = (
+        to_frames(words[-1]["end"])
+        if words
+        else 0
+    )
+
+    # -----------------------------------------
+    # WORD TIMESTAMPS
+    # -----------------------------------------
 
     global_words = []
+
     for w in words:
         global_words.append({
             "word": w["word"],
-            "start_frame": to_frames(w["start"]) + scene_offset_frames,
-            "end_frame": to_frames(w["end"]) + scene_offset_frames,
+            "start_frame": (
+                to_frames(w["start"])
+                + scene_offset_frames
+            ),
+            "end_frame": (
+                to_frames(w["end"])
+                + scene_offset_frames
+            ),
         })
 
-    directions = sorted(scene.get("directions", []), key=lambda d: d["start"])
+    # -----------------------------------------
+    # DIRECTIONS
+    # -----------------------------------------
+
+    directions = sorted(
+        scene.get("directions", []),
+        key=lambda d: d["start"],
+    )
+
     norm_directions = []
 
     for idx, d in enumerate(directions):
-        start_frame = to_frames(d["start"]) + scene_offset_frames
-        end_frame = to_frames(d["end"]) + scene_offset_frames
 
-        if norm_directions and start_frame != norm_directions[-1]["end_frame"]:
-            start_frame = norm_directions[-1]["end_frame"]
+        start_frame = (
+            to_frames(d["start"])
+            + scene_offset_frames
+        )
+
+        end_frame = (
+            to_frames(d["end"])
+            + scene_offset_frames
+        )
+
+        # Ensure no gaps
+        if (
+            norm_directions
+            and start_frame
+            != norm_directions[-1]["end_frame"]
+        ):
+            start_frame = (
+                norm_directions[-1]["end_frame"]
+            )
 
         entry = {
             "id": f"{scene['id']}_{idx}",
-            "type": d.get("type", "B-roll"),
+            "type": d.get(
+                "type",
+                "B-roll",
+            ),
             "start_frame": start_frame,
             "end_frame": end_frame,
         }
 
-        if d.get("asserts"):
-            kind, local_path = _pick_asset(d, tmp_dir)
-            entry["background"] = {"kind": kind, "path": local_path}
+        # -----------------------------------------
+        # PEXELS VIDEO / IMAGE
+        # -----------------------------------------
 
-        template_name, template_props, template_text = _extract_template(d)
+        if d.get("asserts"):
+
+            background = _pick_asset(
+                d,
+                video_id,
+            )
+
+            if background:
+                entry["background"] = background
+
+        # -----------------------------------------
+        # TEMPLATE
+        # -----------------------------------------
+
+        (
+            template_name,
+            template_props,
+            template_text,
+        ) = _extract_template(d)
+
         if template_name:
-            component = TEMPLATE_COMPONENT_MAP.get(template_name)
+
+            component = TEMPLATE_COMPONENT_MAP.get(
+                template_name
+            )
+
             if component is None:
-                print(f"[warn] unknown template_name '{template_name}' on direction {entry['id']}, skipping overlay")
+
+                print(
+                    f"[warn] unknown template_name "
+                    f"'{template_name}' "
+                    f"on direction {entry['id']}, "
+                    f"skipping overlay"
+                )
+
             else:
-                _resolve_template_image(d, template_props)
+
+                _resolve_template_image(
+                    d,
+                    template_props,
+                )
+
                 entry["overlay"] = {
                     "component": component,
                     "template_name": template_name,
@@ -200,9 +459,21 @@ def normalize_scene(scene: dict, scene_offset_frames: int, tmp_dir: str) -> dict
 
         norm_directions.append(entry)
 
+    # -----------------------------------------
+    # MAKE LAST DIRECTION REACH SCENE END
+    # -----------------------------------------
+
     if norm_directions:
-        scene_end_frame = scene_offset_frames + scene_duration_frames
-        norm_directions[-1]["end_frame"] = max(norm_directions[-1]["end_frame"], scene_end_frame)
+
+        scene_end_frame = (
+            scene_offset_frames
+            + scene_duration_frames
+        )
+
+        norm_directions[-1]["end_frame"] = max(
+            norm_directions[-1]["end_frame"],
+            scene_end_frame,
+        )
 
     return {
         "duration_frames": scene_duration_frames,
@@ -216,59 +487,61 @@ def build_render_props(
     tmp_dir: str,
     video_id: str,
 ) -> dict:
+
     scenes = timeline["scenes"]
 
-    # =========================================================
-    # Calculate duration of every scene
-    # =========================================================
+    # -----------------------------------------
+    # CALCULATE SCENE DURATIONS
+    # -----------------------------------------
 
     scene_durations = []
 
     for scene in scenes:
-        words = scene.get("word_timestamps", [])
 
-        last_end = words[-1]["end"] if words else 0.0
+        words = scene.get(
+            "word_timestamps",
+            [],
+        )
+
+        last_end = (
+            words[-1]["end"]
+            if words
+            else 0.0
+        )
 
         scene_durations.append(
             to_frames(last_end)
         )
 
-    # =========================================================
-    # Calculate global scene offsets
-    # =========================================================
+    # -----------------------------------------
+    # CALCULATE OFFSETS
+    # -----------------------------------------
 
     scene_offsets = []
 
     running = 0
 
     for duration in scene_durations:
+
         scene_offsets.append(running)
+
         running += duration
 
     total_frames = running
 
-    # =========================================================
-    # Final render data
-    # =========================================================
+    # -----------------------------------------
+    # OUTPUT ARRAYS
+    # -----------------------------------------
 
     all_words = []
     all_directions = []
     audio_tracks = []
 
-    # =========================================================
-    # Remotion public directory
-    #
-    # Physical files:
-    #
-    # /opt/storybit-remotion/public/
-    #     render-assets/
-    #         <video_id>/
-    #             scene_1.mp3
-    #             scene_2.mp3
-    #
-    # =========================================================
+    # -----------------------------------------
+    # REMOTION PUBLIC ASSET DIRECTORY
+    # -----------------------------------------
 
-    audio_dir = os.path.join(
+    asset_dir = os.path.join(
         REMOTION_PROJECT_DIR,
         "public",
         "render-assets",
@@ -276,13 +549,13 @@ def build_render_props(
     )
 
     os.makedirs(
-        audio_dir,
+        asset_dir,
         exist_ok=True,
     )
 
-    # =========================================================
-    # Process every scene
-    # =========================================================
+    # -----------------------------------------
+    # PROCESS EVERY SCENE
+    # -----------------------------------------
 
     for scene, offset, duration in zip(
         scenes,
@@ -290,14 +563,10 @@ def build_render_props(
         scene_durations,
     ):
 
-        # -----------------------------------------------------
-        # Normalize directions
-        # -----------------------------------------------------
-
         norm = normalize_scene(
             scene,
             offset,
-            tmp_dir,
+            video_id,
         )
 
         all_words.extend(
@@ -308,16 +577,16 @@ def build_render_props(
             norm["directions"]
         )
 
-        # -----------------------------------------------------
-        # Download scene audio
-        # -----------------------------------------------------
+        # -------------------------------------
+        # AUDIO
+        # -------------------------------------
 
         audio_filename = (
             f"scene_{scene['id']}.mp3"
         )
 
         audio_path = os.path.join(
-            audio_dir,
+            asset_dir,
             audio_filename,
         )
 
@@ -326,48 +595,30 @@ def build_render_props(
             audio_path,
         )
 
-        # -----------------------------------------------------
-        # Verify downloaded audio exists
-        # -----------------------------------------------------
-
-        if not os.path.exists(audio_path):
+        if not os.path.exists(
+            audio_path
+        ):
             raise RuntimeError(
-                f"Audio file was not created: {audio_path}"
+                f"Audio file was not created: "
+                f"{audio_path}"
             )
 
-        # -----------------------------------------------------
-        # Path passed to Remotion
-        #
-        # IMPORTANT:
-        #
-        # Do NOT include "public/" here.
-        #
-        # Correct:
-        #
-        # render-assets/video_id/scene_1.mp3
-        #
-        # Wrong:
-        #
-        # public/render-assets/video_id/scene_1.mp3
-        #
-        # -----------------------------------------------------
-
         remotion_audio_path = (
-            f"render-assets/{video_id}/{audio_filename}"
+            f"render-assets/"
+            f"{video_id}/"
+            f"{audio_filename}"
         )
 
-        audio_tracks.append(
-            {
-                "scene_id": scene["id"],
-                "path": remotion_audio_path,
-                "offset_frame": offset,
-                "duration_frames": duration,
-            }
-        )
+        audio_tracks.append({
+            "scene_id": scene["id"],
+            "path": remotion_audio_path,
+            "offset_frame": offset,
+            "duration_frames": duration,
+        })
 
-    # =========================================================
-    # Final props
-    # =========================================================
+    # -----------------------------------------
+    # FINAL PROPS
+    # -----------------------------------------
 
     return {
         "fps": FPS,
@@ -376,21 +627,29 @@ def build_render_props(
 
         "total_frames": total_frames,
 
-        "caption_words_per_line": (
-            CAPTION_WORDS_PER_LINE
-        ),
+        "caption_words_per_line":
+            CAPTION_WORDS_PER_LINE,
 
         "words": all_words,
 
-        "directions": all_directions,
+        "directions":
+            all_directions,
 
-        "audio_tracks": audio_tracks,
+        "audio_tracks":
+            audio_tracks,
     }
 
 
-def render_with_remotion(props: dict, tmp_dir: str) -> str:
+
+def render_with_remotion(
+    props: dict,
+    tmp_dir: str,
+) -> str:
+
     if not REMOTION_PROJECT_DIR:
-        raise RuntimeError("REMOTION_PROJECT_DIR is not set")
+        raise RuntimeError(
+            "REMOTION_PROJECT_DIR is not set"
+        )
 
     props_path = os.path.join(
         tmp_dir,
@@ -402,7 +661,12 @@ def render_with_remotion(props: dict, tmp_dir: str) -> str:
         "w",
         encoding="utf-8",
     ) as f:
-        json.dump(props, f)
+
+        json.dump(
+            props,
+            f,
+            indent=2,
+        )
 
     out_path = os.path.join(
         tmp_dir,
@@ -421,7 +685,6 @@ def render_with_remotion(props: dict, tmp_dir: str) -> str:
     ])
 
     return out_path
-
 
 
 def render_timeline(
