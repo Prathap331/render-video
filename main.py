@@ -39,25 +39,67 @@ def get_timeline(video_id: str):
 
 
 TEMPLATE_COMPONENT_MAP = {
+    "Architecture Diagram": "Architecture",
+    "Archive Photo": "ArchivePhoto",
+    "Bar Chart": "BarChart",
+    "Before / After": "BeforeAfter",
+    "Big Number": "BigNumber",
+    "Callout / Annotation": "Callout",
+    "Word-Synced Captions": "Captions",
+    "Case File": "CaseFile",
+    "Chapter Card": "ChapterCard",
+    "Chat Conversation": "ChatConversation",
+    "Comparison Columns": "ComparisonColumns",
+    "Decision Tree": "DecisionTree",
+    "Document Highlight": "DocumentHighlight",
+    "End Screen": "EndScreen",
+    "Floating Card": "FloatingCard",
+    "Funnel": "Funnel",
+    "Gauge / Meter": "Gauge",
+    "Globe Zoom": "GlobeZoom",
+    "Hierarchy": "Hierarchy",
+    "Icon Array": "IconArray",
+    "Image Caption": "ImageCaption",
+    "Image Grid": "ImageGrid",
+    "Image Montage": "ImageMontage",
+    "Investigation Board": "InvestigationBoard",
+    "Key Statement": "KeyStatement",
+    "Leaderboard": "Leaderboard",
+    "Linear Process": "LinearProcess",
+    "Line Chart": "LineChart",
+    "Location Tag": "LocationTag",
+    "Lower Third": "LowerThird",
+    "Myth vs Fact": "MythFact",
+    "News Headline": "NewsHeadline",
+    "Newspaper Clipping": "NewspaperClipping",
+    "Notification Pop": "NotificationPop",
+    "Number Comparison": "NumberComparison",
+    "Person Intro": "PersonIntro",
+    "Pie / Donut Chart": "PieDonut",
+    "Profile Card": "ProfileCard",
+    "Pros & Cons": "ProsCons",
+    "Punch Word": "PunchWord",
+    "Question Hook": "QuestionHook",
+    "Quote Card": "QuoteCard",
+    "Radius Range": "RadiusRange",
+    "Rank Reveal": "RankReveal",
+    "Relationship": "Relationship",
+    "Roadmap": "Roadmap",
+    "Scribble Annotation": "ScribbleAnnotation",
+    "Search Bar": "SearchBar",
+    "Social Post": "SocialPost",
+    "Source Citation": "SourceCitation",
+    "Stacked Kinetic Text": "StackedText",
+    "Statistic Overlay": "StatOverlay",
+    "Sticky Notes": "StickyNotes",
+    "Structured List": "StructuredList",
+    "Subscribe Reminder": "SubscribeReminder",
+    "Timeline": "Timeline",
     "Title Card": "TitleCard",
     "Title + Metadata": "TitleMetadata",
-    "Big Number": "BigNumber",
-    "Number Comparison": "NumberComparison",
-    "Quote Card": "QuoteCard",
-    "Key Statement": "KeyStatement",
-    "Structured List": "StructuredList",
-    "Comparison Columns": "ComparisonColumns",
-    "Bar Chart": "BarChart",
-    "Line Chart": "LineChart",
-    "Pie / Donut Chart": "PieDonut",
-    "Leaderboard": "Leaderboard",
-    "Timeline": "Timeline",
-    "A → B Relationship": "Relationship",
-    "Person Intro Card": "PersonIntro",
-    "Image + Label / Caption": "ImageCaption",
-    "Linear Process": "LinearProcess",
+    "Travel Route": "TravelRoute",
+    "VS Face-Off": "VsFaceOff",
 }
-
 
 def _run(cmd: list):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -105,18 +147,28 @@ def _normalize_video(src_path: str, dest_path: str):
         "-i", src_path,
 
         # Make every video the same size as the Remotion composition.
+        #
+        # NOTE: a plain "fps=30" here just drops/duplicates frames.
+        # When the source isn't already 30 (or an exact multiple of
+        # 30, e.g. 25fps PAL footage), that duplication happens on a
+        # fixed cadence (e.g. one repeated frame every 6 frames for
+        # 25fps -> 30fps), which is perceived as periodic
+        # stutter/freezing ("stucking") in otherwise-moving footage.
+        # "framerate" blends neighbouring frames instead of duplicating
+        # them, so the change is smooth, and it is ~25x faster than
+        # minterpolate.
         "-vf",
         (
             "scale=1920:1080:"
             "force_original_aspect_ratio=increase,"
             "crop=1920:1080,"
             "setsar=1,"
-            "fps=30"
+            "framerate=fps=30"
         ),
 
         # Browser-friendly video.
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "superfast",
         "-crf", "23",
 
         # Important for Chromium/Remotion compatibility.
@@ -320,13 +372,30 @@ def _extract_template(direction: dict):
     return None, None, None
 
 
-def _resolve_template_image(direction: dict, props: dict):
+def _resolve_template_image(direction: dict, props: dict, template_name: str = ""):
+    photos = (direction.get("asserts") or {}).get("photos") or []
+
+    # ---------------------------------------------------------
+    # BEFORE / AFTER: needs two images (before_url + after_url)
+    # ---------------------------------------------------------
+    if template_name == "Before / After":
+        urls = [p.get("image_url", "") for p in photos if p.get("image_url")]
+
+        if not props.get("before_url") and urls:
+            props["before_url"] = urls[0]
+
+        if not props.get("after_url") and urls:
+            props["after_url"] = urls[1] 
+
+        return
+
+    # ---------------------------------------------------------
+    # ALL OTHER TEMPLATES: single image_url (unchanged behavior)
+    # ---------------------------------------------------------
     if props.get("image_url"):
         return
-    photos = (direction.get("asserts") or {}).get("photos") or []
     if photos:
         props["image_url"] = photos[0].get("image_url", "")
-
 
 def normalize_scene(
     scene: dict,
@@ -347,19 +416,43 @@ def normalize_scene(
     # -----------------------------------------
 
     global_words = []
+    prev_word_end_frame = None
 
     for w in words:
+
+        start_frame = (
+            to_frames(w["start"])
+            + scene_offset_frames
+        )
+
+        end_frame = (
+            to_frames(w["end"])
+            + scene_offset_frames
+        )
+
+        # Ensure no overlap/backwards jump with the previous
+        # word. Independent rounding of each word's start/end
+        # can otherwise make two adjacent words both "active"
+        # (or neither active) on the same frame, which is what
+        # made the captions flicker/shake.
+        if (
+            prev_word_end_frame is not None
+            and start_frame < prev_word_end_frame
+        ):
+            start_frame = prev_word_end_frame
+
+        # Never let a word collapse to zero (or negative)
+        # duration.
+        if end_frame <= start_frame:
+            end_frame = start_frame + 1
+
         global_words.append({
             "word": w["word"],
-            "start_frame": (
-                to_frames(w["start"])
-                + scene_offset_frames
-            ),
-            "end_frame": (
-                to_frames(w["end"])
-                + scene_offset_frames
-            ),
+            "start_frame": start_frame,
+            "end_frame": end_frame,
         })
+
+        prev_word_end_frame = end_frame
 
     # -----------------------------------------
     # DIRECTIONS
@@ -393,6 +486,14 @@ def normalize_scene(
             start_frame = (
                 norm_directions[-1]["end_frame"]
             )
+
+        # Never let a direction (B-roll/overlay) segment
+        # collapse to zero (or negative) duration. Independent
+        # rounding of start/end can otherwise produce a
+        # near-instant segment, which made the background
+        # video appear to flicker/jump between clips ("shaking").
+        if end_frame <= start_frame:
+            end_frame = start_frame + 1
 
         entry = {
             "id": f"{scene['id']}_{idx}",
@@ -448,6 +549,7 @@ def normalize_scene(
                 _resolve_template_image(
                     d,
                     template_props,
+                    template_name,
                 )
 
                 entry["overlay"] = {
