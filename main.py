@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client
+import random
 
 load_dotenv()
 
@@ -15,6 +16,11 @@ FPS = 30
 WIDTH = 1920
 HEIGHT = 1080
 CAPTION_WORDS_PER_LINE = 10
+OUTRO_FRAMES = 150 
+OUTRO_VARIANTS = [
+    "confetti", "hearts", "wave", "stickers", "actions", "namaste",
+    "fireworks", "balloons", "rocket", "diya", "reactions", "sparkle",
+]
 
 RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
 REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR", "/opt/storybit-remotion")
@@ -53,13 +59,13 @@ TEMPLATE_COMPONENT_MAP = {
     "Decision Tree": "DecisionTree",
     "Document Highlight": "DocumentHighlight",
     "End Screen": "EndScreen",
-    "Floating Card": "FloatingCard",
+    "Media + Floating Card": "FloatingCard",
     "Funnel": "Funnel",
     "Gauge / Meter": "Gauge",
-    "Globe Zoom": "GlobeZoom",
-    "Hierarchy": "Hierarchy",
+    "Globe Zoom to Location": "GlobeZoom",
+    "Hierarchy / Tree": "Hierarchy",
     "Icon Array": "IconArray",
-    "Image Caption": "ImageCaption",
+    "Image + Label / Caption": "ImageCaption",
     "Image Grid": "ImageGrid",
     "Image Montage": "ImageMontage",
     "Investigation Board": "InvestigationBoard",
@@ -70,7 +76,7 @@ TEMPLATE_COMPONENT_MAP = {
     "Location Tag": "LocationTag",
     "Lower Third": "LowerThird",
     "Myth vs Fact": "MythFact",
-    "News Headline": "NewsHeadline",
+    "News Headline Card": "NewsHeadline",
     "Newspaper Clipping": "NewspaperClipping",
     "Notification Pop": "NotificationPop",
     "Number Comparison": "NumberComparison",
@@ -81,24 +87,25 @@ TEMPLATE_COMPONENT_MAP = {
     "Punch Word": "PunchWord",
     "Question Hook": "QuestionHook",
     "Quote Card": "QuoteCard",
-    "Radius Range": "RadiusRange",
-    "Rank Reveal": "RankReveal",
-    "Relationship": "Relationship",
+    "Radius / Range": "RadiusRange",
+    "Countdown Rank Reveal": "RankReveal",
+    "A → B Relationship": "Relationship",
     "Roadmap": "Roadmap",
     "Scribble Annotation": "ScribbleAnnotation",
-    "Search Bar": "SearchBar",
+    "Search Bar Typing": "SearchBar",
     "Social Post": "SocialPost",
     "Source Citation": "SourceCitation",
     "Stacked Kinetic Text": "StackedText",
     "Statistic Overlay": "StatOverlay",
-    "Sticky Notes": "StickyNotes",
+    "Sticky Notes Board": "StickyNotes",
     "Structured List": "StructuredList",
     "Subscribe Reminder": "SubscribeReminder",
     "Timeline": "Timeline",
     "Title Card": "TitleCard",
     "Title + Metadata": "TitleMetadata",
-    "Travel Route": "TravelRoute",
+    "Travel Route Map": "TravelRoute",
     "VS Face-Off": "VsFaceOff",
+    "Thank You Outro": "ThankYou",   
 }
 
 def _run(cmd: list):
@@ -372,30 +379,41 @@ def _extract_template(direction: dict):
     return None, None, None
 
 
+def _fill_image_urls(node, photos, counter):
+
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "image_url" and isinstance(value, str) and not value:
+                node[key] = photos[counter[0] % len(photos)]
+                counter[0] += 1
+            else:
+                _fill_image_urls(value, photos, counter)
+    elif isinstance(node, list):
+        for item in node:
+            _fill_image_urls(item, photos, counter)
+
+
 def _resolve_template_image(direction: dict, props: dict, template_name: str = ""):
-    photos = (direction.get("asserts") or {}).get("photos") or []
+    photos = (
+        (direction.get("asserts") or {}).get("photos")
+        or direction.get("template_photos")
+        or []
+    )
+    urls = [p.get("image_url", "") for p in photos if p.get("image_url")]
 
-    # ---------------------------------------------------------
-    # BEFORE / AFTER: needs two images (before_url + after_url)
-    # ---------------------------------------------------------
+    if not urls:
+        return
+
     if template_name == "Before / After":
-        urls = [p.get("image_url", "") for p in photos if p.get("image_url")]
-
-        if not props.get("before_url") and urls:
+        if not props.get("before_url"):
             props["before_url"] = urls[0]
-
-        if not props.get("after_url") and urls:
-            props["after_url"] = urls[1] 
-
+        if not props.get("after_url"):
+            props["after_url"] = urls[1] if len(urls) > 1 else urls[0]
         return
 
-    # ---------------------------------------------------------
-    # ALL OTHER TEMPLATES: single image_url (unchanged behavior)
-    # ---------------------------------------------------------
-    if props.get("image_url"):
-        return
-    if photos:
-        props["image_url"] = photos[0].get("image_url", "")
+    _fill_image_urls(props, urls, [0])
+
+
 
 def normalize_scene(
     scene: dict,
@@ -584,6 +602,28 @@ def normalize_scene(
     }
 
 
+def _build_outro_direction(start_frame: int) -> dict:
+    variant = random.choice(OUTRO_VARIANTS)
+    props = {
+        "title": "Thank you for watching!",
+        "subtitle": "See you in the next one",
+        "variant": variant,
+        "background": "theme",
+    }
+    print(f"[outro] variant: {variant}")
+    return {
+        "id": "outro_thank_you",
+        "type": "Template",
+        "start_frame": start_frame,
+        "end_frame": start_frame + OUTRO_FRAMES,
+        "overlay": {
+            "component": TEMPLATE_COMPONENT_MAP["Thank You Outro"],
+            "template_name": "Thank You Outro",
+            "props": props,
+            "text": props["title"],
+        },
+    }
+
 def build_render_props(
     timeline: dict,
     tmp_dir: str,
@@ -591,10 +631,6 @@ def build_render_props(
 ) -> dict:
 
     scenes = timeline["scenes"]
-
-    # -----------------------------------------
-    # CALCULATE SCENE DURATIONS
-    # -----------------------------------------
 
     scene_durations = []
 
@@ -615,9 +651,6 @@ def build_render_props(
             to_frames(last_end)
         )
 
-    # -----------------------------------------
-    # CALCULATE OFFSETS
-    # -----------------------------------------
 
     scene_offsets = []
 
@@ -631,17 +664,10 @@ def build_render_props(
 
     total_frames = running
 
-    # -----------------------------------------
-    # OUTPUT ARRAYS
-    # -----------------------------------------
-
     all_words = []
     all_directions = []
     audio_tracks = []
 
-    # -----------------------------------------
-    # REMOTION PUBLIC ASSET DIRECTORY
-    # -----------------------------------------
 
     asset_dir = os.path.join(
         REMOTION_PROJECT_DIR,
@@ -654,10 +680,6 @@ def build_render_props(
         asset_dir,
         exist_ok=True,
     )
-
-    # -----------------------------------------
-    # PROCESS EVERY SCENE
-    # -----------------------------------------
 
     for scene, offset, duration in zip(
         scenes,
@@ -679,9 +701,6 @@ def build_render_props(
             norm["directions"]
         )
 
-        # -------------------------------------
-        # AUDIO
-        # -------------------------------------
 
         audio_filename = (
             f"scene_{scene['id']}.mp3"
@@ -718,9 +737,13 @@ def build_render_props(
             "duration_frames": duration,
         })
 
-    # -----------------------------------------
-    # FINAL PROPS
-    # -----------------------------------------
+
+    all_directions.append(
+        _build_outro_direction(total_frames)
+    )
+
+    total_frames += OUTRO_FRAMES
+
 
     return {
         "fps": FPS,
