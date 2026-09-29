@@ -860,8 +860,36 @@ app.add_middleware(
 )
 
 
+
+def upload_to_supabase(video_id: str, output_path: str) -> str:
+    bucket = "rendered-videos"
+    storage_path = f"{video_id}.mp4"
+
+    with open(output_path, "rb") as f:
+        supabase.storage.from_(bucket).upload(
+            path=storage_path,
+            file=f,
+            file_options={
+                "content-type": "video/mp4",
+                "upsert": "true",  # overwrite if re-rendered
+            },
+        )
+
+    public_url = supabase.storage.from_(bucket).get_public_url(storage_path)
+
+    supabase.table("videos").update(
+        {"video_url": public_url}
+    ).eq("id", video_id).execute()
+
+    return public_url
+
 @app.post("/render/{video_id}")
 async def render_video(video_id: str):
     timeline = get_timeline(video_id)
     output_path = render_timeline(video_id, timeline, RENDER_TMP_ROOT)
-    return {"video_id": video_id, "output_path": output_path}
+    video_url = upload_to_supabase(video_id, output_path)
+    return {
+        "video_id": video_id,
+        "output_path": output_path,
+        "video_url": video_url,
+    }
