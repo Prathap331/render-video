@@ -203,10 +203,30 @@ def _ext_from_url(url: str, default: str) -> str:
 
 def _pick_asset(direction: dict, video_id: str):
 
+    # ============================================================
+    # 1. GET AVAILABLE MEDIA
+    # ============================================================
+
     assets = direction.get("asserts") or {}
 
     videos = assets.get("videos") or []
     photos = assets.get("photos") or []
+
+    # ============================================================
+    # 2. GET SELECTED MEDIA
+    # ============================================================
+
+    selected_media_id = direction.get("selected_media_id")
+    selected_media_type = direction.get("selected_media_type")
+
+    print(
+        f"[media] selected_media_id={selected_media_id}, "
+        f"selected_media_type={selected_media_type}"
+    )
+
+    # ============================================================
+    # 3. ASSET DIRECTORY
+    # ============================================================
 
     asset_dir = os.path.join(
         REMOTION_PROJECT_DIR,
@@ -217,146 +237,382 @@ def _pick_asset(direction: dict, video_id: str):
 
     os.makedirs(asset_dir, exist_ok=True)
 
-    # =========================================================
-    # PREFER VIDEO
-    # =========================================================
+    # ============================================================
+    # 4. SELECTED VIDEO
+    # ============================================================
 
-    if videos:
+    if (
+        selected_media_id is not None
+        and selected_media_type == "video"
+    ):
 
-        video = videos[0]
-
-        url = video["video_url"]
-
-        ext = _ext_from_url(url, "mp4")
-
-        # Original downloaded file.
-        source_filename = (
-            f"video_{video['id']}_source.{ext}"
+        selected_video = next(
+            (
+                video
+                for video in videos
+                if str(video.get("id")) == str(selected_media_id)
+            ),
+            None,
         )
 
-        source_path = os.path.join(
-            asset_dir,
-            source_filename,
-        )
-
-        # Final normalized file that Remotion will use.
-        final_filename = (
-            f"video_{video['id']}.mp4"
-        )
-
-        final_path = os.path.join(
-            asset_dir,
-            final_filename,
-        )
-
-        try:
-
-            # -------------------------------------------------
-            # DOWNLOAD ORIGINAL
-            # -------------------------------------------------
-
-            _download(
-                url,
-                source_path,
+        if selected_video is None:
+            print(
+                f"[warn] selected video "
+                f"id={selected_media_id} not found in asserts"
             )
 
-            # -------------------------------------------------
-            # NORMALIZE FOR REMOTION
-            # -------------------------------------------------
+        else:
 
-            # Always normalize the source.
-            #
-            # This is intentional because an old final MP4
-            # may already exist and may be the problematic file.
-            _normalize_video(
-                source_path,
-                final_path,
-            )
+            url = selected_video.get("video_url")
 
-            if not os.path.exists(final_path):
-                raise RuntimeError(
-                    f"Normalized video was not created: "
-                    f"{final_path}"
+            if not url:
+                print(
+                    f"[warn] selected video "
+                    f"id={selected_media_id} has no video_url"
                 )
 
-            print(
-                f"[video] normalized: "
-                f"{source_path} -> {final_path}"
-            )
+            else:
 
-            return {
-                "kind": "video",
-                "path": (
-                    f"render-assets/"
-                    f"{video_id}/"
-                    f"{final_filename}"
-                ),
-            }
+                ext = _ext_from_url(url, "mp4")
 
-        except Exception as e:
+                source_filename = (
+                    f"video_{selected_media_id}_source.{ext}"
+                )
 
-            print(
-                f"[warn] video processing failed "
-                f"({url}): {e}"
-            )
+                source_path = os.path.join(
+                    asset_dir,
+                    source_filename,
+                )
 
-            # If normalization failed, remove the broken
-            # output so Remotion never receives it.
-            if os.path.exists(final_path):
+                final_filename = (
+                    f"video_{selected_media_id}.mp4"
+                )
+
+                final_path = os.path.join(
+                    asset_dir,
+                    final_filename,
+                )
+
                 try:
-                    os.remove(final_path)
-                except Exception:
-                    pass
 
-    # =========================================================
-    # OTHERWISE IMAGE
-    # =========================================================
+                    _download(
+                        url,
+                        source_path,
+                    )
 
-    if photos:
+                    _normalize_video(
+                        source_path,
+                        final_path,
+                    )
 
-        photo = photos[0]
+                    if not os.path.exists(final_path):
+                        raise RuntimeError(
+                            f"Normalized video was not created: "
+                            f"{final_path}"
+                        )
 
-        url = photo["image_url"]
+                    print(
+                        f"[video] selected: "
+                        f"id={selected_media_id}"
+                    )
 
-        ext = _ext_from_url(
-            url,
-            "jpg",
+                    print(
+                        f"[video] query: "
+                        f"{selected_video.get('query', '')}"
+                    )
+
+                    print(
+                        f"[video] normalized: "
+                        f"{source_path} -> {final_path}"
+                    )
+
+                    return {
+                        "kind": "video",
+                        "path": (
+                            f"render-assets/"
+                            f"{video_id}/"
+                            f"{final_filename}"
+                        ),
+                    }
+
+                except Exception as e:
+
+                    print(
+                        f"[warn] selected video processing "
+                        f"failed ({url}): {e}"
+                    )
+
+                    if os.path.exists(final_path):
+                        try:
+                            os.remove(final_path)
+                        except Exception:
+                            pass
+
+    # ============================================================
+    # 5. SELECTED PHOTO
+    # ============================================================
+
+    if (
+        selected_media_id is not None
+        and selected_media_type == "photo"
+    ):
+
+        selected_photo = next(
+            (
+                photo
+                for photo in photos
+                if str(photo.get("id")) == str(selected_media_id)
+            ),
+            None,
         )
 
-        filename = (
-            f"photo_{photo['id']}.{ext}"
-        )
-
-        local_path = os.path.join(
-            asset_dir,
-            filename,
-        )
-
-        try:
-
-            _download(
-                url,
-                local_path,
-            )
-
-            return {
-                "kind": "photo",
-                "path": (
-                    f"render-assets/"
-                    f"{video_id}/"
-                    f"{filename}"
-                ),
-            }
-
-        except Exception as e:
-
+        if selected_photo is None:
             print(
-                f"[warn] photo download failed "
-                f"({url}): {e}"
+                f"[warn] selected photo "
+                f"id={selected_media_id} not found in asserts"
             )
+
+        else:
+
+            url = selected_photo.get("image_url")
+
+            if not url:
+                print(
+                    f"[warn] selected photo "
+                    f"id={selected_media_id} has no image_url"
+                )
+
+            else:
+
+                ext = _ext_from_url(url, "jpg")
+
+                filename = (
+                    f"photo_{selected_media_id}.{ext}"
+                )
+
+                local_path = os.path.join(
+                    asset_dir,
+                    filename,
+                )
+
+                try:
+
+                    _download(
+                        url,
+                        local_path,
+                    )
+
+                    if not os.path.exists(local_path):
+                        raise RuntimeError(
+                            f"Photo was not downloaded: "
+                            f"{local_path}"
+                        )
+
+                    print(
+                        f"[photo] selected: "
+                        f"id={selected_media_id}"
+                    )
+
+                    print(
+                        f"[photo] query: "
+                        f"{selected_photo.get('query', '')}"
+                    )
+
+                    print(
+                        f"[photo] downloaded: "
+                        f"{local_path}"
+                    )
+
+                    return {
+                        "kind": "photo",
+                        "path": (
+                            f"render-assets/"
+                            f"{video_id}/"
+                            f"{filename}"
+                        ),
+                    }
+
+                except Exception as e:
+
+                    print(
+                        f"[warn] selected photo download "
+                        f"failed ({url}): {e}"
+                    )
+
+    # ============================================================
+    # 6. NO SELECTION
+    #
+    # Fallback:
+    #   video first
+    #   photo second
+    # ============================================================
+
+    if selected_media_id is None:
+
+        # --------------------------------------------------------
+        # 6A. First video
+        # --------------------------------------------------------
+
+        if videos:
+
+            video = videos[0]
+
+            url = video.get("video_url")
+
+            if url:
+
+                video_id_value = video.get("id")
+
+                ext = _ext_from_url(
+                    url,
+                    "mp4",
+                )
+
+                source_filename = (
+                    f"video_{video_id_value}_source.{ext}"
+                )
+
+                source_path = os.path.join(
+                    asset_dir,
+                    source_filename,
+                )
+
+                final_filename = (
+                    f"video_{video_id_value}.mp4"
+                )
+
+                final_path = os.path.join(
+                    asset_dir,
+                    final_filename,
+                )
+
+                try:
+
+                    _download(
+                        url,
+                        source_path,
+                    )
+
+                    _normalize_video(
+                        source_path,
+                        final_path,
+                    )
+
+                    if not os.path.exists(final_path):
+                        raise RuntimeError(
+                            f"Normalized video was not created: "
+                            f"{final_path}"
+                        )
+
+                    print(
+                        f"[video] fallback selected: "
+                        f"id={video_id_value}"
+                    )
+
+                    print(
+                        f"[video] query: "
+                        f"{video.get('query', '')}"
+                    )
+
+                    return {
+                        "kind": "video",
+                        "path": (
+                            f"render-assets/"
+                            f"{video_id}/"
+                            f"{final_filename}"
+                        ),
+                    }
+
+                except Exception as e:
+
+                    print(
+                        f"[warn] fallback video processing "
+                        f"failed ({url}): {e}"
+                    )
+
+                    if os.path.exists(final_path):
+                        try:
+                            os.remove(final_path)
+                        except Exception:
+                            pass
+
+        # --------------------------------------------------------
+        # 6B. First photo
+        # --------------------------------------------------------
+
+        if photos:
+
+            photo = photos[0]
+
+            url = photo.get("image_url")
+
+            if url:
+
+                photo_id_value = photo.get("id")
+
+                ext = _ext_from_url(
+                    url,
+                    "jpg",
+                )
+
+                filename = (
+                    f"photo_{photo_id_value}.{ext}"
+                )
+
+                local_path = os.path.join(
+                    asset_dir,
+                    filename,
+                )
+
+                try:
+
+                    _download(
+                        url,
+                        local_path,
+                    )
+
+                    if not os.path.exists(local_path):
+                        raise RuntimeError(
+                            f"Photo was not downloaded: "
+                            f"{local_path}"
+                        )
+
+                    print(
+                        f"[photo] fallback selected: "
+                        f"id={photo_id_value}"
+                    )
+
+                    print(
+                        f"[photo] query: "
+                        f"{photo.get('query', '')}"
+                    )
+
+                    return {
+                        "kind": "photo",
+                        "path": (
+                            f"render-assets/"
+                            f"{video_id}/"
+                            f"{filename}"
+                        ),
+                    }
+
+                except Exception as e:
+
+                    print(
+                        f"[warn] fallback photo download "
+                        f"failed ({url}): {e}"
+                    )
+
+    # ============================================================
+    # 7. NOTHING FOUND
+    # ============================================================
+
+    print(
+        f"[warn] no usable media found "
+        f"for video_id={video_id}"
+    )
 
     return None
-
 
 def to_frames(seconds: float) -> int:
     return round(seconds * FPS)
