@@ -24,7 +24,7 @@ OUTRO_VARIANTS = [
 
 RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT","/tmp/storybit-render")
 os.makedirs(RENDER_TMP_ROOT, exist_ok=True)
-REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR","/root/remotion-renderer")
+REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR")
 REMOTION_ENTRY = os.path.join(REMOTION_PROJECT_DIR, "src", "index.ts")
 REMOTION_COMPOSITION_ID = os.getenv("REMOTION_COMPOSITION_ID", "MainVideo")
 
