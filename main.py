@@ -22,8 +22,8 @@ OUTRO_VARIANTS = [
     "fireworks", "balloons", "rocket", "diya", "reactions", "sparkle",
 ]
 
-RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
-REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR", "/opt/storybit-remotion")
+RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT")
+REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR")
 REMOTION_ENTRY = os.path.join(REMOTION_PROJECT_DIR, "src", "index.ts")
 REMOTION_COMPOSITION_ID = os.getenv("REMOTION_COMPOSITION_ID", "MainVideo")
 
@@ -429,9 +429,6 @@ def normalize_scene(
         else 0
     )
 
-    # -----------------------------------------
-    # WORD TIMESTAMPS
-    # -----------------------------------------
 
     global_words = []
     prev_word_end_frame = None
@@ -871,7 +868,7 @@ def upload_to_supabase(video_id: str, output_path: str) -> str:
             file=f,
             file_options={
                 "content-type": "video/mp4",
-                "upsert": "true",  # overwrite if re-rendered
+                "upsert": "true", 
             },
         )
 
@@ -890,6 +887,5 @@ async def render_video(video_id: str):
     video_url = upload_to_supabase(video_id, output_path)
     return {
         "video_id": video_id,
-        "output_path": output_path,
         "video_url": video_url,
     }
