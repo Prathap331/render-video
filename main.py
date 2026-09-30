@@ -763,7 +763,6 @@ def build_render_props(
     }
 
 
-
 def render_with_remotion(
     props: dict,
     tmp_dir: str,
@@ -796,19 +795,30 @@ def render_with_remotion(
         "output.mp4",
     )
 
+    remotion_cli = os.path.join(
+        REMOTION_PROJECT_DIR,
+        "node_modules",
+        ".bin",
+        "remotion",
+    )
+
+    public_dir = os.path.join(
+        REMOTION_PROJECT_DIR,
+        "public",
+    )
+
     _run([
-        "/opt/storybit-remotion/node_modules/.bin/remotion",
+        remotion_cli,
         "render",
         REMOTION_ENTRY,
         REMOTION_COMPOSITION_ID,
         out_path,
         f"--props={props_path}",
-        "--public-dir=/opt/storybit-remotion/public",
+        f"--public-dir={public_dir}",
         "--concurrency=4",
     ])
 
     return out_path
-
 
 def render_timeline(
     video_id: str,
