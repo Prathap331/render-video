@@ -2,12 +2,16 @@ import os
 import json
 import subprocess
 import requests
+import threading
+import uuid
+import shutil
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client
 import random
+
 
 load_dotenv()
 
@@ -125,14 +129,27 @@ def _run(cmd: list):
 def _download(url: str, dest_path: str) -> str:
     if os.path.exists(dest_path):
         return dest_path
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 16):
-                f.write(chunk)
-    return dest_path
 
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+    tmp_path = f"{dest_path}.{uuid.uuid4().hex}.part"
+
+    try:
+        with requests.get(url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 16):
+                    f.write(chunk)
+
+        os.replace(tmp_path, dest_path)  # atomic rename
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    return dest_path
 
 def _normalize_video(src_path: str, dest_path: str):
     """
@@ -145,54 +162,59 @@ def _normalize_video(src_path: str, dest_path: str):
     - 30 FPS
     - faststart
     - no audio
+
+    Writes to a temp file and renames, so dest_path is never
+    a partially written file.
     """
 
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-    _run([
-        "ffmpeg",
-        "-y",
-        "-i", src_path,
+    tmp_dest = f"{dest_path}.{uuid.uuid4().hex}.tmp.mp4"
 
-        # Make every video the same size as the Remotion composition.
-        #
-        # NOTE: a plain "fps=30" here just drops/duplicates frames.
-        # When the source isn't already 30 (or an exact multiple of
-        # 30, e.g. 25fps PAL footage), that duplication happens on a
-        # fixed cadence (e.g. one repeated frame every 6 frames for
-        # 25fps -> 30fps), which is perceived as periodic
-        # stutter/freezing ("stucking") in otherwise-moving footage.
-        # "framerate" blends neighbouring frames instead of duplicating
-        # them, so the change is smooth, and it is ~25x faster than
-        # minterpolate.
-        "-vf",
-        (
-            "scale=1920:1080:"
-            "force_original_aspect_ratio=increase,"
-            "crop=1920:1080,"
-            "setsar=1,"
-            "framerate=fps=30"
-        ),
+    try:
+        _run([
+            "ffmpeg",
+            "-y",
+            "-i", src_path,
 
-        # Browser-friendly video.
-        "-c:v", "libx264",
-        "-preset", "superfast",
-        "-crf", "23",
+            # "framerate" blends neighbouring frames instead of
+            # duplicating them, avoiding periodic stutter when the
+            # source isn't 30fps (e.g. 25fps footage).
+            "-vf",
+            (
+                "scale=1920:1080:"
+                "force_original_aspect_ratio=increase,"
+                "crop=1920:1080,"
+                "setsar=1,"
+                "framerate=fps=30"
+            ),
 
-        # Important for Chromium/Remotion compatibility.
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "main",
-        "-level:v", "4.1",
+            # Browser-friendly video.
+            "-c:v", "libx264",
+            "-preset", "superfast",
+            "-crf", "23",
 
-        # Put MP4 metadata at the beginning.
-        "-movflags", "+faststart",
+            # Important for Chromium/Remotion compatibility.
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "main",
+            "-level:v", "4.1",
 
-        # B-roll doesn't need its source audio.
-        "-an",
+            # Put MP4 metadata at the beginning.
+            "-movflags", "+faststart",
 
-        dest_path,
-    ])
+            # B-roll doesn't need its source audio.
+            "-an",
 
+            tmp_dest,
+        ])
+
+        os.replace(tmp_dest, dest_path)  # atomic rename
+    finally:
+        if os.path.exists(tmp_dest):
+            try:
+                os.remove(tmp_dest)
+            except Exception:
+                pass
 
 def _ext_from_url(url: str, default: str) -> str:
     tail = url.split("?")[0]
@@ -1019,37 +1041,21 @@ def build_render_props(
     }
 
 
+
 def render_with_remotion(
     props: dict,
     tmp_dir: str,
 ) -> str:
 
     if not REMOTION_PROJECT_DIR:
-        raise RuntimeError(
-            "REMOTION_PROJECT_DIR is not set"
-        )
+        raise RuntimeError("REMOTION_PROJECT_DIR is not set")
 
-    props_path = os.path.join(
-        tmp_dir,
-        "props.json",
-    )
+    props_path = os.path.join(tmp_dir, "props.json")
 
-    with open(
-        props_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
+    with open(props_path, "w", encoding="utf-8") as f:
+        json.dump(props, f, indent=2)
 
-        json.dump(
-            props,
-            f,
-            indent=2,
-        )
-
-    out_path = os.path.join(
-        tmp_dir,
-        "output.mp4",
-    )
+    out_path = os.path.join(tmp_dir, "output.mp4")
 
     remotion_cli = os.path.join(
         REMOTION_PROJECT_DIR,
@@ -1058,10 +1064,7 @@ def render_with_remotion(
         "remotion",
     )
 
-    public_dir = os.path.join(
-        REMOTION_PROJECT_DIR,
-        "public",
-    )
+    public_dir = os.path.join(REMOTION_PROJECT_DIR, "public")
 
     _run([
         remotion_cli,
@@ -1074,7 +1077,15 @@ def render_with_remotion(
         "--concurrency=4",
     ])
 
+    # Fail with a clear message instead of a confusing
+    # FileNotFoundError later during upload.
+    if not os.path.exists(out_path):
+        raise RuntimeError(
+            f"Remotion finished but output is missing: {out_path}"
+        )
+
     return out_path
+
 
 def render_timeline(
     video_id: str,
@@ -1084,13 +1095,10 @@ def render_timeline(
 
     tmp_dir = os.path.join(
         render_tmp_root,
-        video_id,
+        f"{video_id}-{uuid.uuid4().hex[:8]}",
     )
 
-    os.makedirs(
-        tmp_dir,
-        exist_ok=True,
-    )
+    os.makedirs(tmp_dir, exist_ok=True)
 
     props = build_render_props(
         timeline,
@@ -1102,7 +1110,6 @@ def render_timeline(
         props,
         tmp_dir,
     )
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1147,12 +1154,39 @@ def upload_to_supabase(video_id: str, output_path: str) -> str:
 
     return public_url
 
+_render_locks: dict[str, threading.Lock] = {}
+_render_locks_guard = threading.Lock()
+
+
+def _get_lock(video_id: str) -> threading.Lock:
+    with _render_locks_guard:
+        return _render_locks.setdefault(video_id, threading.Lock())
+
+
 @app.post("/render/{video_id}")
-async def render_video(video_id: str):
-    timeline = get_timeline(video_id)
-    output_path = render_timeline(video_id, timeline, RENDER_TMP_ROOT)
-    video_url = upload_to_supabase(video_id, output_path)
-    return {
-        "video_id": video_id,
-        "video_url": video_url,
-    }
+def render_video(video_id: str):
+    lock = _get_lock(video_id)
+
+    if not lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Render already in progress for this video",
+        )
+
+    tmp_dir = None
+
+    try:
+        timeline = get_timeline(video_id)
+        output_path = render_timeline(video_id, timeline, RENDER_TMP_ROOT)
+        tmp_dir = os.path.dirname(output_path)
+
+        video_url = upload_to_supabase(video_id, output_path)
+
+        return {
+            "video_id": video_id,
+            "video_url": video_url,
+        }
+    finally:
+        lock.release()
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
