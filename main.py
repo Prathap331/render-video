@@ -85,7 +85,8 @@ TEMPLATE_COMPONENT_MAP = {
     "Newspaper Clipping": "NewspaperClipping",
     "Notification Pop": "NotificationPop",
     "Number Comparison": "NumberComparison",
-    "Person Intro Card": "PersonIntro",
+    "Person Intro": "PersonIntro",
+    "Person Intro Card": "PersonIntro",  # added: DB name differs from the original map key
     "Pie / Donut Chart": "PieDonut",
     "Profile Card": "ProfileCard",
     "Pros & Cons": "ProsCons",
@@ -215,6 +216,22 @@ def _normalize_video(src_path: str, dest_path: str):
                 os.remove(tmp_dest)
             except Exception:
                 pass
+
+def _video_duration_frames(path: str) -> int:
+    try:
+        proc = _run([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        seconds = float(proc.stdout.decode().strip())
+        # trim 2 frames (~0.07s) so the frozen last frame is never shown
+        return max(1, int(seconds * FPS) - 2)
+    except Exception as e:
+        print(f"[warn] could not read video duration ({path}): {e}")
+        return 0
+
 
 def _ext_from_url(url: str, default: str) -> str:
     tail = url.split("?")[0]
@@ -350,6 +367,7 @@ def _pick_asset(direction: dict, video_id: str):
 
                     return {
                         "kind": "video",
+                        "duration_frames": _video_duration_frames(final_path),
                         "path": (
                             f"render-assets/"
                             f"{video_id}/"
@@ -538,6 +556,7 @@ def _pick_asset(direction: dict, video_id: str):
 
                     return {
                         "kind": "video",
+                        "duration_frames": _video_duration_frames(final_path),
                         "path": (
                             f"render-assets/"
                             f"{video_id}/"
@@ -855,9 +874,14 @@ def normalize_scene(
 
                 # -------------------------------------
                 # OVERLAY TIMING (B-roll + overlay only)
-                # B-roll plays start_frame -> end_frame.
-                # Animation plays only overlay start_frame
-                # -> end_frame, in sync with the voice.
+                #
+                # The B-roll plays from entry start_frame
+                # to end_frame. The animation plays only
+                # from overlay start_frame to end_frame,
+                # in sync with the voice. Both are absolute
+                # frames on the same timeline.
+                # full_screen_animation gets no overlay
+                # frames and covers the whole beat.
                 # -------------------------------------
 
                 if (
@@ -903,6 +927,7 @@ def normalize_scene(
         "words": global_words,
         "directions": norm_directions,
     }
+
 
 def _build_outro_direction(start_frame: int) -> dict:
     variant = random.choice(OUTRO_VARIANTS)
