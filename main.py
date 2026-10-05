@@ -85,7 +85,7 @@ TEMPLATE_COMPONENT_MAP = {
     "Newspaper Clipping": "NewspaperClipping",
     "Notification Pop": "NotificationPop",
     "Number Comparison": "NumberComparison",
-    "Person Intro": "PersonIntro",
+    "Person Intro Card": "PersonIntro",
     "Pie / Donut Chart": "PieDonut",
     "Profile Card": "ProfileCard",
     "Pros & Cons": "ProsCons",
