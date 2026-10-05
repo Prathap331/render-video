@@ -853,6 +853,33 @@ def normalize_scene(
                     "text": template_text,
                 }
 
+                # -------------------------------------
+                # OVERLAY TIMING (B-roll + overlay only)
+                # B-roll plays start_frame -> end_frame.
+                # Animation plays only overlay start_frame
+                # -> end_frame, in sync with the voice.
+                # -------------------------------------
+
+                if (
+                    d.get("type") == "B-roll+overlay_animation"
+                    and d.get("overlay_start") is not None
+                    and d.get("overlay_end") is not None
+                ):
+                    o_start = (
+                        to_frames(d["overlay_start"])
+                        + scene_offset_frames
+                    )
+                    o_end = (
+                        to_frames(d["overlay_end"])
+                        + scene_offset_frames
+                    )
+
+                    o_start = max(start_frame, min(o_start, end_frame))
+                    o_end = max(o_start + 1, min(o_end, end_frame))
+
+                    entry["overlay"]["start_frame"] = o_start
+                    entry["overlay"]["end_frame"] = o_end
+
         norm_directions.append(entry)
 
     # -----------------------------------------
@@ -876,7 +903,6 @@ def normalize_scene(
         "words": global_words,
         "directions": norm_directions,
     }
-
 
 def _build_outro_direction(start_frame: int) -> dict:
     variant = random.choice(OUTRO_VARIANTS)
