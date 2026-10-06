@@ -55,7 +55,6 @@ TEMPLATE_COMPONENT_MAP = {
     "Bar Chart": "BarChart",
     "Before / After": "BeforeAfter",
     "Big Number": "BigNumber",
-    "Callout / Annotation": "Callout",
     "Word-Synced Captions": "Captions",
     "Case File": "CaseFile",
     "Chapter Card": "ChapterCard",
