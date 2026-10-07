@@ -20,13 +20,25 @@ FPS = 30
 WIDTH = 1920
 HEIGHT = 1080
 CAPTION_WORDS_PER_LINE = 10
-OUTRO_FRAMES = 150 
+OUTRO_FRAMES = 150
 OUTRO_VARIANTS = [
     "confetti", "hearts", "wave", "stickers", "actions", "namaste",
     "fireworks", "balloons", "rocket", "diya", "reactions", "sparkle",
 ]
 
-RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT","/tmp/storybit-render")
+# ------------------------------------------------------------
+# OUTPUT SIZE CAP
+# Hard limit is 500 MB. We aim a bit lower (default 450 MB) when
+# re-encoding so the result reliably ends up under the limit.
+# ------------------------------------------------------------
+MAX_OUTPUT_MB = int(os.getenv("MAX_OUTPUT_MB", "500"))
+TARGET_OUTPUT_MB = int(os.getenv("TARGET_OUTPUT_MB", "450"))
+MAX_OUTPUT_BYTES = MAX_OUTPUT_MB * 1024 * 1024
+TARGET_OUTPUT_BYTES = TARGET_OUTPUT_MB * 1024 * 1024
+AUDIO_BITRATE_BPS = 128_000
+MAX_SHRINK_ATTEMPTS = 3
+
+RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
 os.makedirs(RENDER_TMP_ROOT, exist_ok=True)
 REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR")
 REMOTION_ENTRY = os.path.join(REMOTION_PROJECT_DIR, "src", "index.ts")
@@ -110,8 +122,9 @@ TEMPLATE_COMPONENT_MAP = {
     "Title + Metadata": "TitleMetadata",
     "Travel Route Map": "TravelRoute",
     "VS Face-Off": "VsFaceOff",
-    "Thank You Outro": "ThankYou",   
+    "Thank You Outro": "ThankYou",
 }
+
 
 def _run(cmd: list):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -123,7 +136,6 @@ def _run(cmd: list):
             + proc.stderr.decode("utf-8", errors="ignore")[-4000:]
         )
     return proc
-
 
 
 def _download(url: str, dest_path: str) -> str:
@@ -150,6 +162,7 @@ def _download(url: str, dest_path: str) -> str:
                 pass
 
     return dest_path
+
 
 def _normalize_video(src_path: str, dest_path: str):
     """
@@ -216,6 +229,7 @@ def _normalize_video(src_path: str, dest_path: str):
             except Exception:
                 pass
 
+
 def _video_duration_frames(path: str) -> int:
     try:
         proc = _run([
@@ -232,6 +246,16 @@ def _video_duration_frames(path: str) -> int:
         return 0
 
 
+def _video_duration_seconds(path: str) -> float:
+    proc = _run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ])
+    return float(proc.stdout.decode().strip())
+
+
 def _ext_from_url(url: str, default: str) -> str:
     tail = url.split("?")[0]
     if "." in tail.rsplit("/", 1)[-1]:
@@ -239,21 +263,98 @@ def _ext_from_url(url: str, default: str) -> str:
     return default
 
 
+def _safe_remove(path: str):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _try_video_asset(video: dict, asset_dir: str, video_id: str, label: str):
+    """
+    Download + normalize a video entry. Returns the asset dict,
+    or None if it could not be used.
+    """
+    video_item_id = video.get("id")
+    url = video.get("video_url")
+
+    if not url:
+        print(f"[warn] {label} video id={video_item_id} has no video_url")
+        return None
+
+    ext = _ext_from_url(url, "mp4")
+    source_path = os.path.join(asset_dir, f"video_{video_item_id}_source.{ext}")
+    final_filename = f"video_{video_item_id}.mp4"
+    final_path = os.path.join(asset_dir, final_filename)
+
+    try:
+        _download(url, source_path)
+        _normalize_video(source_path, final_path)
+
+        if not os.path.exists(final_path):
+            raise RuntimeError(f"Normalized video was not created: {final_path}")
+
+        print(f"[video] {label}: id={video_item_id}")
+        print(f"[video] query: {video.get('query', '')}")
+        print(f"[video] normalized: {source_path} -> {final_path}")
+
+        return {
+            "kind": "video",
+            "duration_frames": _video_duration_frames(final_path),
+            "path": f"render-assets/{video_id}/{final_filename}",
+        }
+
+    except Exception as e:
+        print(f"[warn] {label} video processing failed ({url}): {e}")
+        _safe_remove(final_path)
+        return None
+
+
+def _try_photo_asset(photo: dict, asset_dir: str, video_id: str, label: str):
+    """
+    Download a photo entry. Returns the asset dict, or None if it
+    could not be used.
+    """
+    photo_item_id = photo.get("id")
+    url = photo.get("image_url")
+
+    if not url:
+        print(f"[warn] {label} photo id={photo_item_id} has no image_url")
+        return None
+
+    ext = _ext_from_url(url, "jpg")
+    filename = f"photo_{photo_item_id}.{ext}"
+    local_path = os.path.join(asset_dir, filename)
+
+    try:
+        _download(url, local_path)
+
+        if not os.path.exists(local_path):
+            raise RuntimeError(f"Photo was not downloaded: {local_path}")
+
+        print(f"[photo] {label}: id={photo_item_id}")
+        print(f"[photo] query: {photo.get('query', '')}")
+        print(f"[photo] downloaded: {local_path}")
+
+        return {
+            "kind": "photo",
+            "path": f"render-assets/{video_id}/{filename}",
+        }
+
+    except Exception as e:
+        print(f"[warn] {label} photo download failed ({url}): {e}")
+        return None
+
+
 def _pick_asset(direction: dict, video_id: str):
 
-    # ============================================================
     # 1. GET AVAILABLE MEDIA
-    # ============================================================
-
     assets = direction.get("asserts") or {}
-
     videos = assets.get("videos") or []
     photos = assets.get("photos") or []
 
-    # ============================================================
     # 2. GET SELECTED MEDIA
-    # ============================================================
-
     selected_media_id = direction.get("selected_media_id")
     selected_media_type = direction.get("selected_media_type")
 
@@ -262,401 +363,66 @@ def _pick_asset(direction: dict, video_id: str):
         f"selected_media_type={selected_media_type}"
     )
 
-    # ============================================================
     # 3. ASSET DIRECTORY
-    # ============================================================
-
     asset_dir = os.path.join(
         REMOTION_PROJECT_DIR,
         "public",
         "render-assets",
         video_id,
     )
-
     os.makedirs(asset_dir, exist_ok=True)
 
-    # ============================================================
     # 4. SELECTED VIDEO
-    # ============================================================
-
-    if (
-        selected_media_id is not None
-        and selected_media_type == "video"
-    ):
+    if selected_media_id is not None and selected_media_type == "video":
 
         selected_video = next(
-            (
-                video
-                for video in videos
-                if str(video.get("id")) == str(selected_media_id)
-            ),
+            (v for v in videos if str(v.get("id")) == str(selected_media_id)),
             None,
         )
 
         if selected_video is None:
-            print(
-                f"[warn] selected video "
-                f"id={selected_media_id} not found in asserts"
-            )
-
+            print(f"[warn] selected video id={selected_media_id} not found in asserts")
         else:
+            result = _try_video_asset(selected_video, asset_dir, video_id, "selected")
+            if result:
+                return result
 
-            url = selected_video.get("video_url")
-
-            if not url:
-                print(
-                    f"[warn] selected video "
-                    f"id={selected_media_id} has no video_url"
-                )
-
-            else:
-
-                ext = _ext_from_url(url, "mp4")
-
-                source_filename = (
-                    f"video_{selected_media_id}_source.{ext}"
-                )
-
-                source_path = os.path.join(
-                    asset_dir,
-                    source_filename,
-                )
-
-                final_filename = (
-                    f"video_{selected_media_id}.mp4"
-                )
-
-                final_path = os.path.join(
-                    asset_dir,
-                    final_filename,
-                )
-
-                try:
-
-                    _download(
-                        url,
-                        source_path,
-                    )
-
-                    _normalize_video(
-                        source_path,
-                        final_path,
-                    )
-
-                    if not os.path.exists(final_path):
-                        raise RuntimeError(
-                            f"Normalized video was not created: "
-                            f"{final_path}"
-                        )
-
-                    print(
-                        f"[video] selected: "
-                        f"id={selected_media_id}"
-                    )
-
-                    print(
-                        f"[video] query: "
-                        f"{selected_video.get('query', '')}"
-                    )
-
-                    print(
-                        f"[video] normalized: "
-                        f"{source_path} -> {final_path}"
-                    )
-
-                    return {
-                        "kind": "video",
-                        "duration_frames": _video_duration_frames(final_path),
-                        "path": (
-                            f"render-assets/"
-                            f"{video_id}/"
-                            f"{final_filename}"
-                        ),
-                    }
-
-                except Exception as e:
-
-                    print(
-                        f"[warn] selected video processing "
-                        f"failed ({url}): {e}"
-                    )
-
-                    if os.path.exists(final_path):
-                        try:
-                            os.remove(final_path)
-                        except Exception:
-                            pass
-
-    # ============================================================
     # 5. SELECTED PHOTO
-    # ============================================================
-
-    if (
-        selected_media_id is not None
-        and selected_media_type == "photo"
-    ):
+    if selected_media_id is not None and selected_media_type == "photo":
 
         selected_photo = next(
-            (
-                photo
-                for photo in photos
-                if str(photo.get("id")) == str(selected_media_id)
-            ),
+            (p for p in photos if str(p.get("id")) == str(selected_media_id)),
             None,
         )
 
         if selected_photo is None:
-            print(
-                f"[warn] selected photo "
-                f"id={selected_media_id} not found in asserts"
-            )
-
+            print(f"[warn] selected photo id={selected_media_id} not found in asserts")
         else:
+            result = _try_photo_asset(selected_photo, asset_dir, video_id, "selected")
+            if result:
+                return result
 
-            url = selected_photo.get("image_url")
-
-            if not url:
-                print(
-                    f"[warn] selected photo "
-                    f"id={selected_media_id} has no image_url"
-                )
-
-            else:
-
-                ext = _ext_from_url(url, "jpg")
-
-                filename = (
-                    f"photo_{selected_media_id}.{ext}"
-                )
-
-                local_path = os.path.join(
-                    asset_dir,
-                    filename,
-                )
-
-                try:
-
-                    _download(
-                        url,
-                        local_path,
-                    )
-
-                    if not os.path.exists(local_path):
-                        raise RuntimeError(
-                            f"Photo was not downloaded: "
-                            f"{local_path}"
-                        )
-
-                    print(
-                        f"[photo] selected: "
-                        f"id={selected_media_id}"
-                    )
-
-                    print(
-                        f"[photo] query: "
-                        f"{selected_photo.get('query', '')}"
-                    )
-
-                    print(
-                        f"[photo] downloaded: "
-                        f"{local_path}"
-                    )
-
-                    return {
-                        "kind": "photo",
-                        "path": (
-                            f"render-assets/"
-                            f"{video_id}/"
-                            f"{filename}"
-                        ),
-                    }
-
-                except Exception as e:
-
-                    print(
-                        f"[warn] selected photo download "
-                        f"failed ({url}): {e}"
-                    )
-
-    # ============================================================
-    # 6. NO SELECTION
-    #
-    # Fallback:
-    #   video first
-    #   photo second
-    # ============================================================
-
+    # 6. NO SELECTION -> fallback: video first, photo second
     if selected_media_id is None:
 
-        # --------------------------------------------------------
-        # 6A. First video
-        # --------------------------------------------------------
-
         if videos:
-
-            video = videos[0]
-
-            url = video.get("video_url")
-
-            if url:
-
-                video_id_value = video.get("id")
-
-                ext = _ext_from_url(
-                    url,
-                    "mp4",
-                )
-
-                source_filename = (
-                    f"video_{video_id_value}_source.{ext}"
-                )
-
-                source_path = os.path.join(
-                    asset_dir,
-                    source_filename,
-                )
-
-                final_filename = (
-                    f"video_{video_id_value}.mp4"
-                )
-
-                final_path = os.path.join(
-                    asset_dir,
-                    final_filename,
-                )
-
-                try:
-
-                    _download(
-                        url,
-                        source_path,
-                    )
-
-                    _normalize_video(
-                        source_path,
-                        final_path,
-                    )
-
-                    if not os.path.exists(final_path):
-                        raise RuntimeError(
-                            f"Normalized video was not created: "
-                            f"{final_path}"
-                        )
-
-                    print(
-                        f"[video] fallback selected: "
-                        f"id={video_id_value}"
-                    )
-
-                    print(
-                        f"[video] query: "
-                        f"{video.get('query', '')}"
-                    )
-
-                    return {
-                        "kind": "video",
-                        "duration_frames": _video_duration_frames(final_path),
-                        "path": (
-                            f"render-assets/"
-                            f"{video_id}/"
-                            f"{final_filename}"
-                        ),
-                    }
-
-                except Exception as e:
-
-                    print(
-                        f"[warn] fallback video processing "
-                        f"failed ({url}): {e}"
-                    )
-
-                    if os.path.exists(final_path):
-                        try:
-                            os.remove(final_path)
-                        except Exception:
-                            pass
-
-        # --------------------------------------------------------
-        # 6B. First photo
-        # --------------------------------------------------------
+            result = _try_video_asset(videos[0], asset_dir, video_id, "fallback selected")
+            if result:
+                return result
 
         if photos:
+            result = _try_photo_asset(photos[0], asset_dir, video_id, "fallback selected")
+            if result:
+                return result
 
-            photo = photos[0]
-
-            url = photo.get("image_url")
-
-            if url:
-
-                photo_id_value = photo.get("id")
-
-                ext = _ext_from_url(
-                    url,
-                    "jpg",
-                )
-
-                filename = (
-                    f"photo_{photo_id_value}.{ext}"
-                )
-
-                local_path = os.path.join(
-                    asset_dir,
-                    filename,
-                )
-
-                try:
-
-                    _download(
-                        url,
-                        local_path,
-                    )
-
-                    if not os.path.exists(local_path):
-                        raise RuntimeError(
-                            f"Photo was not downloaded: "
-                            f"{local_path}"
-                        )
-
-                    print(
-                        f"[photo] fallback selected: "
-                        f"id={photo_id_value}"
-                    )
-
-                    print(
-                        f"[photo] query: "
-                        f"{photo.get('query', '')}"
-                    )
-
-                    return {
-                        "kind": "photo",
-                        "path": (
-                            f"render-assets/"
-                            f"{video_id}/"
-                            f"{filename}"
-                        ),
-                    }
-
-                except Exception as e:
-
-                    print(
-                        f"[warn] fallback photo download "
-                        f"failed ({url}): {e}"
-                    )
-
-    # ============================================================
     # 7. NOTHING FOUND
-    # ============================================================
-
-    print(
-        f"[warn] no usable media found "
-        f"for video_id={video_id}"
-    )
+    print(f"[warn] no usable media found for video_id={video_id}")
 
     return None
 
+
 def to_frames(seconds: float) -> int:
     return round(seconds * FPS)
-
 
 
 def _extract_template(direction: dict):
@@ -711,7 +477,6 @@ def _resolve_template_image(direction: dict, props: dict, template_name: str = "
     _fill_image_urls(props, urls, [0])
 
 
-
 def normalize_scene(
     scene: dict,
     scene_offset_frames: int,
@@ -726,21 +491,13 @@ def normalize_scene(
         else 0
     )
 
-
     global_words = []
     prev_word_end_frame = None
 
     for w in words:
 
-        start_frame = (
-            to_frames(w["start"])
-            + scene_offset_frames
-        )
-
-        end_frame = (
-            to_frames(w["end"])
-            + scene_offset_frames
-        )
+        start_frame = to_frames(w["start"]) + scene_offset_frames
+        end_frame = to_frames(w["end"]) + scene_offset_frames
 
         # Ensure no overlap/backwards jump with the previous
         # word. Independent rounding of each word's start/end
@@ -779,25 +536,15 @@ def normalize_scene(
 
     for idx, d in enumerate(directions):
 
-        start_frame = (
-            to_frames(d["start"])
-            + scene_offset_frames
-        )
-
-        end_frame = (
-            to_frames(d["end"])
-            + scene_offset_frames
-        )
+        start_frame = to_frames(d["start"]) + scene_offset_frames
+        end_frame = to_frames(d["end"]) + scene_offset_frames
 
         # Ensure no gaps
         if (
             norm_directions
-            and start_frame
-            != norm_directions[-1]["end_frame"]
+            and start_frame != norm_directions[-1]["end_frame"]
         ):
-            start_frame = (
-                norm_directions[-1]["end_frame"]
-            )
+            start_frame = norm_directions[-1]["end_frame"]
 
         # Never let a direction (B-roll/overlay) segment
         # collapse to zero (or negative) duration. Independent
@@ -809,10 +556,7 @@ def normalize_scene(
 
         entry = {
             "id": f"{scene['id']}_{idx}",
-            "type": d.get(
-                "type",
-                "B-roll",
-            ),
+            "type": d.get("type", "B-roll"),
             "start_frame": start_frame,
             "end_frame": end_frame,
         }
@@ -823,10 +567,7 @@ def normalize_scene(
 
         if d.get("asserts"):
 
-            background = _pick_asset(
-                d,
-                video_id,
-            )
+            background = _pick_asset(d, video_id)
 
             if background:
                 entry["background"] = background
@@ -843,9 +584,7 @@ def normalize_scene(
 
         if template_name:
 
-            component = TEMPLATE_COMPONENT_MAP.get(
-                template_name
-            )
+            component = TEMPLATE_COMPONENT_MAP.get(template_name)
 
             if component is None:
 
@@ -858,11 +597,7 @@ def normalize_scene(
 
             else:
 
-                _resolve_template_image(
-                    d,
-                    template_props,
-                    template_name,
-                )
+                _resolve_template_image(d, template_props, template_name)
 
                 entry["overlay"] = {
                     "component": component,
@@ -888,14 +623,8 @@ def normalize_scene(
                     and d.get("overlay_start") is not None
                     and d.get("overlay_end") is not None
                 ):
-                    o_start = (
-                        to_frames(d["overlay_start"])
-                        + scene_offset_frames
-                    )
-                    o_end = (
-                        to_frames(d["overlay_end"])
-                        + scene_offset_frames
-                    )
+                    o_start = to_frames(d["overlay_start"]) + scene_offset_frames
+                    o_end = to_frames(d["overlay_end"]) + scene_offset_frames
 
                     o_start = max(start_frame, min(o_start, end_frame))
                     o_end = max(o_start + 1, min(o_end, end_frame))
@@ -911,10 +640,7 @@ def normalize_scene(
 
     if norm_directions:
 
-        scene_end_frame = (
-            scene_offset_frames
-            + scene_duration_frames
-        )
+        scene_end_frame = scene_offset_frames + scene_duration_frames
 
         norm_directions[-1]["end_frame"] = max(
             norm_directions[-1]["end_frame"],
@@ -950,6 +676,7 @@ def _build_outro_direction(start_frame: int) -> dict:
         },
     }
 
+
 def build_render_props(
     timeline: dict,
     tmp_dir: str,
@@ -962,30 +689,18 @@ def build_render_props(
 
     for scene in scenes:
 
-        words = scene.get(
-            "word_timestamps",
-            [],
-        )
+        words = scene.get("word_timestamps", [])
 
-        last_end = (
-            words[-1]["end"]
-            if words
-            else 0.0
-        )
+        last_end = words[-1]["end"] if words else 0.0
 
-        scene_durations.append(
-            to_frames(last_end)
-        )
-
+        scene_durations.append(to_frames(last_end))
 
     scene_offsets = []
 
     running = 0
 
     for duration in scene_durations:
-
         scene_offsets.append(running)
-
         running += duration
 
     total_frames = running
@@ -994,7 +709,6 @@ def build_render_props(
     all_directions = []
     audio_tracks = []
 
-
     asset_dir = os.path.join(
         REMOTION_PROJECT_DIR,
         "public",
@@ -1002,10 +716,7 @@ def build_render_props(
         video_id,
     )
 
-    os.makedirs(
-        asset_dir,
-        exist_ok=True,
-    )
+    os.makedirs(asset_dir, exist_ok=True)
 
     for scene, offset, duration in zip(
         scenes,
@@ -1013,48 +724,21 @@ def build_render_props(
         scene_durations,
     ):
 
-        norm = normalize_scene(
-            scene,
-            offset,
-            video_id,
-        )
+        norm = normalize_scene(scene, offset, video_id)
 
-        all_words.extend(
-            norm["words"]
-        )
+        all_words.extend(norm["words"])
+        all_directions.extend(norm["directions"])
 
-        all_directions.extend(
-            norm["directions"]
-        )
+        audio_filename = f"scene_{scene['id']}.mp3"
 
+        audio_path = os.path.join(asset_dir, audio_filename)
 
-        audio_filename = (
-            f"scene_{scene['id']}.mp3"
-        )
+        _download(scene["audio_url"], audio_path)
 
-        audio_path = os.path.join(
-            asset_dir,
-            audio_filename,
-        )
+        if not os.path.exists(audio_path):
+            raise RuntimeError(f"Audio file was not created: {audio_path}")
 
-        _download(
-            scene["audio_url"],
-            audio_path,
-        )
-
-        if not os.path.exists(
-            audio_path
-        ):
-            raise RuntimeError(
-                f"Audio file was not created: "
-                f"{audio_path}"
-            )
-
-        remotion_audio_path = (
-            f"render-assets/"
-            f"{video_id}/"
-            f"{audio_filename}"
-        )
+        remotion_audio_path = f"render-assets/{video_id}/{audio_filename}"
 
         audio_tracks.append({
             "scene_id": scene["id"],
@@ -1063,33 +747,103 @@ def build_render_props(
             "duration_frames": duration,
         })
 
-
-    all_directions.append(
-        _build_outro_direction(total_frames)
-    )
+    all_directions.append(_build_outro_direction(total_frames))
 
     total_frames += OUTRO_FRAMES
-
 
     return {
         "fps": FPS,
         "width": WIDTH,
         "height": HEIGHT,
-
         "total_frames": total_frames,
-
-        "caption_words_per_line":
-            CAPTION_WORDS_PER_LINE,
-
+        "caption_words_per_line": CAPTION_WORDS_PER_LINE,
         "words": all_words,
-
-        "directions":
-            all_directions,
-
-        "audio_tracks":
-            audio_tracks,
+        "directions": all_directions,
+        "audio_tracks": audio_tracks,
     }
 
+
+def _mb(num_bytes: int) -> float:
+    return num_bytes / (1024 * 1024)
+
+
+def enforce_size_limit(out_path: str, tmp_dir: str) -> str:
+    """
+    Make sure the rendered video is below MAX_OUTPUT_MB.
+
+    - If it is already small enough, nothing happens.
+    - Otherwise it is re-encoded with ffmpeg at a bitrate computed
+      from the video duration so the file lands near
+      TARGET_OUTPUT_MB. If the result is still too big, the bitrate
+      is lowered and it is tried again (up to MAX_SHRINK_ATTEMPTS).
+
+    Returns the path of the final file (same out_path, replaced
+    in place).
+    """
+
+    size = os.path.getsize(out_path)
+    print(f"[size] rendered output: {_mb(size):.1f} MB (limit {MAX_OUTPUT_MB} MB)")
+
+    if size <= MAX_OUTPUT_BYTES:
+        return out_path
+
+    duration = _video_duration_seconds(out_path)
+
+    if duration <= 0:
+        raise RuntimeError("Could not determine video duration for compression")
+
+    target_bytes = TARGET_OUTPUT_BYTES
+
+    for attempt in range(1, MAX_SHRINK_ATTEMPTS + 1):
+
+        # total bits budget -> subtract audio -> video bitrate
+        total_bps = (target_bytes * 8) / duration
+        video_bps = int(max(total_bps - AUDIO_BITRATE_BPS, 200_000))
+
+        print(
+            f"[size] attempt {attempt}/{MAX_SHRINK_ATTEMPTS}: "
+            f"re-encoding at ~{video_bps / 1_000_000:.2f} Mbps video "
+            f"(target {_mb(target_bytes):.0f} MB)"
+        )
+
+        small_path = os.path.join(tmp_dir, f"output_small_{attempt}.mp4")
+
+        try:
+            _run([
+                "ffmpeg",
+                "-y",
+                "-i", out_path,
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-b:v", str(video_bps),
+                "-maxrate", str(video_bps),
+                "-bufsize", str(video_bps * 2),
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "main",
+                "-level:v", "4.1",
+                "-c:a", "aac",
+                "-b:a", str(AUDIO_BITRATE_BPS),
+                "-movflags", "+faststart",
+                small_path,
+            ])
+
+            new_size = os.path.getsize(small_path)
+            print(f"[size] re-encoded output: {_mb(new_size):.1f} MB")
+
+            if new_size <= MAX_OUTPUT_BYTES:
+                os.replace(small_path, out_path)
+                return out_path
+
+            # Still too big -> lower the target and try again.
+            target_bytes = int(target_bytes * 0.8)
+
+        finally:
+            _safe_remove(small_path)
+
+    raise RuntimeError(
+        f"Could not bring video under {MAX_OUTPUT_MB} MB "
+        f"after {MAX_SHRINK_ATTEMPTS} attempts"
+    )
 
 
 def render_with_remotion(
@@ -1134,6 +888,9 @@ def render_with_remotion(
             f"Remotion finished but output is missing: {out_path}"
         )
 
+    # Make sure the final file is under the size limit (500 MB).
+    out_path = enforce_size_limit(out_path, tmp_dir)
+
     return out_path
 
 
@@ -1150,16 +907,10 @@ def render_timeline(
 
     os.makedirs(tmp_dir, exist_ok=True)
 
-    props = build_render_props(
-        timeline,
-        tmp_dir,
-        video_id,
-    )
+    props = build_render_props(timeline, tmp_dir, video_id)
 
-    return render_with_remotion(
-        props,
-        tmp_dir,
-    )
+    return render_with_remotion(props, tmp_dir)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1181,7 +932,6 @@ app.add_middleware(
 )
 
 
-
 def upload_to_supabase(video_id: str, output_path: str) -> str:
     bucket = "rendered-videos"
     storage_path = f"{video_id}.mp4"
@@ -1192,7 +942,7 @@ def upload_to_supabase(video_id: str, output_path: str) -> str:
             file=f,
             file_options={
                 "content-type": "video/mp4",
-                "upsert": "true", 
+                "upsert": "true",
             },
         )
 
@@ -1203,6 +953,7 @@ def upload_to_supabase(video_id: str, output_path: str) -> str:
     ).eq("id", video_id).execute()
 
     return public_url
+
 
 _render_locks: dict[str, threading.Lock] = {}
 _render_locks_guard = threading.Lock()
@@ -1230,7 +981,13 @@ def render_video(video_id: str):
         output_path = render_timeline(video_id, timeline, RENDER_TMP_ROOT)
         tmp_dir = os.path.dirname(output_path)
 
-        video_url = upload_to_supabase(video_id, output_path)
+        try:
+            video_url = upload_to_supabase(video_id, output_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upload failed: {e}",
+            )
 
         return {
             "video_id": video_id,
