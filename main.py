@@ -1046,10 +1046,6 @@ def apply_custom_text_overlays(
                 escaped_text_path = escape_filter_path(text_path)
                 escaped_font_path = escape_filter_path(font_path)
 
-                # ------------------------------------------------
-                # FADE ANIMATIONS
-                # ------------------------------------------------
-
                 animation = str(
                     item.get("animation", "none")
                 ).lower()
@@ -1079,7 +1075,7 @@ def apply_custom_text_overlays(
                         f"\\,max(0\\,(t-{start})/{fade_duration})"
                         f"\\,if(lt(t\\,{end - fade_duration})"
                         f"\\,1"
-                        f"\\,max(0\\,({end}-t)/{fade_duration}))"
+                        f"\\,max(0\\,({end}-t)/{fade_duration})))"
                     )
 
                 if animation in (
@@ -1089,9 +1085,6 @@ def apply_custom_text_overlays(
                 ):
                     alpha = f"max(0\\,min(1\\,{alpha}))"
 
-                # ------------------------------------------------
-                # DRAWTEXT FILTER
-                # ------------------------------------------------
 
                 filter_string = (
                     "drawtext="
