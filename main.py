@@ -894,6 +894,273 @@ def render_with_remotion(
     return out_path
 
 
+
+
+
+
+def apply_custom_text_overlays(
+    video_path: str,
+    timeline: dict,
+    tmp_dir: str,
+) -> str:
+
+    import re
+
+    scenes = timeline.get("scenes", [])
+
+    CUSTOM_FONTS_DIR = "/root/remotion-renderer/public/fonts"
+
+    FONT_MAP = {
+        "Roboto": "Roboto/Font.ttf",
+        "Open Sans": "OpenSans/Font.ttf",
+        "Montserrat": "Montserrat/Font.ttf",
+        "Oswald": "Oswald/Font.ttf",
+        "Poppins": "Poppins/Font.ttf",
+        "Lato": "Lato/Font.ttf",
+        "Playfair Display": "PlayfairDisplay/Font.ttf",
+        "Merriweather": "Merriweather/Font.ttf",
+        "Bebas Neue": "BebasNeue/Font.ttf",
+        "Inter": "Inter/Font.ttf",
+    }
+
+    def escape_filter_path(path: str) -> str:
+        """Escape paths used inside FFmpeg filter arguments."""
+        return (
+            path
+            .replace("\\", "\\\\")
+            .replace(":", "\\:")
+            .replace("'", "\\'")
+            .replace(",", "\\,")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+            .replace(";", "\\;")
+        )
+
+    def valid_color(value, default: str) -> str:
+        value = str(value or default)
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            return value
+        return default
+
+    # Calculate each scene's global offset using the same timing
+    # logic as build_render_props().
+    scene_offsets = []
+    running_frames = 0
+
+    for scene in scenes:
+        scene_offsets.append(running_frames)
+
+        words = scene.get("word_timestamps", [])
+        duration_frames = to_frames(words[-1]["end"]) if words else 0
+
+        running_frames += duration_frames
+
+    filters = []
+    text_files = []
+
+    try:
+        for scene, offset_frames in zip(scenes, scene_offsets):
+            offset_seconds = offset_frames / FPS
+
+            for index, item in enumerate(scene.get("custom_text", [])):
+                text = str(item.get("text", ""))
+
+                if not text.strip():
+                    continue
+
+                # Convert scene-relative times into global video times.
+                try:
+                    start = float(item.get("start", 0)) + offset_seconds
+                    end = float(item.get("end", 0)) + offset_seconds
+                except (TypeError, ValueError):
+                    print(
+                        f"[custom-text] Invalid timing in scene "
+                        f"{scene.get('id')}; skipping overlay"
+                    )
+                    continue
+
+                if start < 0 or end <= start:
+                    print(
+                        f"[custom-text] Invalid start/end in scene "
+                        f"{scene.get('id')}; skipping overlay"
+                    )
+                    continue
+
+                # Center coordinates in the 1920x1080 composition.
+                try:
+                    x = float(item.get("x", WIDTH / 2))
+                    y = float(item.get("y", HEIGHT / 2))
+                    font_size = int(item.get("font_size", 60))
+                    opacity = float(item.get("background_opacity", 0))
+                except (TypeError, ValueError):
+                    print(
+                        f"[custom-text] Invalid styling in scene "
+                        f"{scene.get('id')}; skipping overlay"
+                    )
+                    continue
+
+                x = max(0, min(x, WIDTH))
+                y = max(0, min(y, HEIGHT))
+                font_size = max(1, min(font_size, 300))
+                opacity = max(0.0, min(opacity, 1.0))
+
+                # Resolve font.
+                font_family = str(item.get("font_family", "Roboto"))
+                relative_font_path = FONT_MAP.get(
+                    font_family,
+                    FONT_MAP["Roboto"],
+                )
+
+                font_path = os.path.join(
+                    CUSTOM_FONTS_DIR,
+                    relative_font_path,
+                )
+
+                if not os.path.isfile(font_path):
+                    raise FileNotFoundError(
+                        f"Custom text font not found: {font_path}"
+                    )
+
+                # Validate colors.
+                text_color = valid_color(
+                    item.get("text_color", "#FFFFFF"),
+                    "#FFFFFF",
+                )
+
+                background_color = valid_color(
+                    item.get("background_color", "#000000"),
+                    "#000000",
+                )
+
+                # Use a text file to avoid FFmpeg text escaping issues.
+                text_path = os.path.join(
+                    tmp_dir,
+                    f"custom_text_{uuid.uuid4().hex}.txt",
+                )
+
+                with open(text_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+
+                text_files.append(text_path)
+
+                escaped_text_path = escape_filter_path(text_path)
+                escaped_font_path = escape_filter_path(font_path)
+
+                # ------------------------------------------------
+                # FADE ANIMATIONS
+                # ------------------------------------------------
+
+                animation = str(
+                    item.get("animation", "none")
+                ).lower()
+
+                duration = end - start
+                fade_duration = min(0.5, duration / 2)
+
+                alpha = "1"
+
+                if animation == "fade_in":
+                    alpha = (
+                        f"if(lt(t\\,{start + fade_duration})"
+                        f"\\,max(0\\,(t-{start})/{fade_duration})"
+                        f"\\,1)"
+                    )
+
+                elif animation == "fade_out":
+                    alpha = (
+                        f"if(lt(t\\,{end - fade_duration})"
+                        f"\\,1"
+                        f"\\,max(0\\,({end}-t)/{fade_duration}))"
+                    )
+
+                elif animation == "fade_in_out":
+                    alpha = (
+                        f"if(lt(t\\,{start + fade_duration})"
+                        f"\\,max(0\\,(t-{start})/{fade_duration})"
+                        f"\\,if(lt(t\\,{end - fade_duration})"
+                        f"\\,1"
+                        f"\\,max(0\\,({end}-t)/{fade_duration}))"
+                    )
+
+                if animation in (
+                    "fade_in",
+                    "fade_out",
+                    "fade_in_out",
+                ):
+                    alpha = f"max(0\\,min(1\\,{alpha}))"
+
+                # ------------------------------------------------
+                # DRAWTEXT FILTER
+                # ------------------------------------------------
+
+                filter_string = (
+                    "drawtext="
+                    f"fontfile='{escaped_font_path}':"
+                    f"textfile='{escaped_text_path}':"
+                    f"expansion=none:"
+                    f"fontsize={font_size}:"
+                    f"fontcolor=0x{text_color[1:]}:"
+                    f"alpha='{alpha}':"
+                    "box=1:"
+                    f"boxcolor=0x{background_color[1:]}@{opacity}:"
+                    "boxborderw=12:"
+                    f"x={x}-text_w/2:"
+                    f"y={y}-text_h/2:"
+                    f"enable='between(t\\,{start}\\,{end})'"
+                )
+
+                filters.append(filter_string)
+
+                print(
+                    f"[custom-text] scene={scene.get('id')} "
+                    f"font={font_family} "
+                    f"start={start:.2f}s "
+                    f"end={end:.2f}s "
+                    f"animation={animation}"
+                )
+
+        # No overlays to apply.
+        if not filters:
+            print("[custom-text] No custom text overlays found")
+            return video_path
+
+        output_path = os.path.join(
+            tmp_dir,
+            "output_custom_text.mp4",
+        )
+
+        # Apply all overlays in a single FFmpeg pass.
+        _run([
+            "ffmpeg",
+            "-y",
+            "-i", video_path,
+            "-vf", ",".join(filters),
+            "-c:v", "libx264",
+            "-preset", "superfast",
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_path,
+        ])
+
+        if not os.path.isfile(output_path):
+            raise RuntimeError(
+                "FFmpeg did not create the custom text output"
+            )
+
+        print(f"[custom-text] Rendered: {output_path}")
+
+        return output_path
+
+    finally:
+        for text_path in text_files:
+            _safe_remove(text_path)
+
+
+
+
+
 def render_timeline(
     video_id: str,
     timeline: dict,
@@ -909,7 +1176,17 @@ def render_timeline(
 
     props = build_render_props(timeline, tmp_dir, video_id)
 
-    return render_with_remotion(props, tmp_dir)
+    output_path = render_with_remotion(props, tmp_dir)
+
+    output_path = apply_custom_text_overlays(
+        output_path,
+        timeline,
+        tmp_dir,
+    )
+
+    output_path = enforce_size_limit(output_path, tmp_dir)
+
+    return output_path
 
 
 @asynccontextmanager
