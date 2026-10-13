@@ -477,6 +477,95 @@ def _resolve_template_image(direction: dict, props: dict, template_name: str = "
     _fill_image_urls(props, urls, [0])
 
 
+
+import re  # add to the imports at the top of your file
+
+# Also change this constant at the top of your file:
+# CAPTION_WORDS_PER_LINE = 1   # each caption entry is now a full sentence
+
+# Sentence boundaries: . ! ? and the Devanagari danda (। ॥)
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?।॥])\s+')
+_COMMA_SPLIT = re.compile(r'(?<=[,،])\s+')
+MAX_CAPTION_CHARS = 90  # sentences longer than this are split at commas
+
+
+def _split_sentences(text: str) -> list:
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    sentences = []
+    for s in _SENTENCE_SPLIT.split(text):
+        s = s.strip()
+        if not s:
+            continue
+
+        if len(s) <= MAX_CAPTION_CHARS:
+            sentences.append(s)
+            continue
+
+        # Long sentence -> split at commas, then merge small parts
+        # back together so we don't create tiny captions.
+        parts = [p.strip() for p in _COMMA_SPLIT.split(s) if p.strip()]
+        current = ""
+        for p in parts:
+            if current and len(current) + 1 + len(p) > MAX_CAPTION_CHARS:
+                sentences.append(current)
+                current = p
+            else:
+                current = f"{current} {p}".strip()
+        if current:
+            sentences.append(current)
+
+    return sentences
+
+
+def _sentence_caption_entries(scene: dict, scene_offset_frames: int) -> list:
+    words = scene.get("word_timestamps", [])
+    if not words:
+        return []
+
+    sentences = _split_sentences(scene.get("script", ""))
+
+    if not sentences:
+        # Fallback: split the STT chunks themselves
+        for w in words:
+            sentences.extend(_split_sentences(w.get("word", "")))
+
+    if not sentences:
+        return []
+
+    start_f = scene_offset_frames + to_frames(words[0]["start"])
+    end_f = scene_offset_frames + to_frames(words[-1]["end"])
+    span = max(len(sentences), end_f - start_f)
+
+    # Weight by character count (spaces ignored)
+    weights = [max(1, len(re.sub(r"\s", "", s))) for s in sentences]
+    total_w = sum(weights)
+
+    entries = []
+    cumulative = 0
+    prev = start_f
+
+    for i, (sentence, weight) in enumerate(zip(sentences, weights)):
+        cumulative += weight
+
+        if i == len(sentences) - 1:
+            nxt = max(end_f, prev + 1)
+        else:
+            nxt = start_f + round(span * cumulative / total_w)
+            nxt = max(nxt, prev + 1)  # never zero-length
+
+        entries.append({
+            "word": sentence,
+            "start_frame": prev,
+            "end_frame": nxt,
+        })
+        prev = nxt
+
+    return entries
+
+
 def normalize_scene(
     scene: dict,
     scene_offset_frames: int,
@@ -491,37 +580,11 @@ def normalize_scene(
         else 0
     )
 
-    global_words = []
-    prev_word_end_frame = None
+    # -----------------------------------------
+    # CAPTIONS (sentence-wise)
+    # -----------------------------------------
 
-    for w in words:
-
-        start_frame = to_frames(w["start"]) + scene_offset_frames
-        end_frame = to_frames(w["end"]) + scene_offset_frames
-
-        # Ensure no overlap/backwards jump with the previous
-        # word. Independent rounding of each word's start/end
-        # can otherwise make two adjacent words both "active"
-        # (or neither active) on the same frame, which is what
-        # made the captions flicker/shake.
-        if (
-            prev_word_end_frame is not None
-            and start_frame < prev_word_end_frame
-        ):
-            start_frame = prev_word_end_frame
-
-        # Never let a word collapse to zero (or negative)
-        # duration.
-        if end_frame <= start_frame:
-            end_frame = start_frame + 1
-
-        global_words.append({
-            "word": w["word"],
-            "start_frame": start_frame,
-            "end_frame": end_frame,
-        })
-
-        prev_word_end_frame = end_frame
+    global_words = _sentence_caption_entries(scene, scene_offset_frames)
 
     # -----------------------------------------
     # DIRECTIONS
@@ -547,10 +610,7 @@ def normalize_scene(
             start_frame = norm_directions[-1]["end_frame"]
 
         # Never let a direction (B-roll/overlay) segment
-        # collapse to zero (or negative) duration. Independent
-        # rounding of start/end can otherwise produce a
-        # near-instant segment, which made the background
-        # video appear to flicker/jump between clips ("shaking").
+        # collapse to zero (or negative) duration.
         if end_frame <= start_frame:
             end_frame = start_frame + 1
 
@@ -608,14 +668,6 @@ def normalize_scene(
 
                 # -------------------------------------
                 # OVERLAY TIMING (B-roll + overlay only)
-                #
-                # The B-roll plays from entry start_frame
-                # to end_frame. The animation plays only
-                # from overlay start_frame to end_frame,
-                # in sync with the voice. Both are absolute
-                # frames on the same timeline.
-                # full_screen_animation gets no overlay
-                # frames and covers the whole beat.
                 # -------------------------------------
 
                 if (
@@ -634,9 +686,6 @@ def normalize_scene(
 
         norm_directions.append(entry)
 
-    # -----------------------------------------
-    # MAKE LAST DIRECTION REACH SCENE END
-    # -----------------------------------------
 
     if norm_directions:
 
@@ -652,6 +701,7 @@ def normalize_scene(
         "words": global_words,
         "directions": norm_directions,
     }
+
 
 
 def _build_outro_direction(start_frame: int) -> dict:
