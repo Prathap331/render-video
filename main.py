@@ -26,11 +26,10 @@ OUTRO_VARIANTS = [
     "fireworks", "balloons", "rocket", "diya", "reactions", "sparkle",
 ]
 
-# ------------------------------------------------------------
-# OUTPUT SIZE CAP
-# Hard limit is 500 MB. We aim a bit lower (default 450 MB) when
-# re-encoding so the result reliably ends up under the limit.
-# ------------------------------------------------------------
+PHOTO_ANIMATIONS = ["zoom_in", "zoom_out", "pan_left_to_right", "pan_right_to_left"]
+PHOTO_ZOOM_AMOUNT = 0.15      # 15% zoom for zoom in/out and pans
+PHOTO_PAD_SECONDS = 1.0       # extra tail so the clip is never shorter than its slot
+
 MAX_OUTPUT_MB = int(os.getenv("MAX_OUTPUT_MB", "500"))
 TARGET_OUTPUT_MB = int(os.getenv("TARGET_OUTPUT_MB", "450"))
 MAX_OUTPUT_BYTES = MAX_OUTPUT_MB * 1024 * 1024
@@ -230,6 +229,85 @@ def _normalize_video(src_path: str, dest_path: str):
                 pass
 
 
+def _animate_photo(src_path: str, dest_path: str, duration_sec: float, style: str):
+    """
+    Turn a still photo into a 1920x1080 / 30 FPS H.264 MP4 with a
+    Ken Burns style animation.
+
+    Styles:
+    - zoom_in
+    - zoom_out
+    - pan_left_to_right
+    - pan_right_to_left
+
+    Writes to a temp file and renames, so dest_path is never
+    a partially written file.
+    """
+
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+    total_frames = max(2, int(round(duration_sec * FPS)))
+    n = total_frames - 1  # last frame index
+    amt = PHOTO_ZOOM_AMOUNT
+
+    center_x = "iw/2-(iw/zoom/2)"
+    center_y = "ih/2-(ih/zoom/2)"
+
+    if style == "zoom_in":
+        z = f"1+{amt}*on/{n}"
+        x, y = center_x, center_y
+    elif style == "zoom_out":
+        z = f"1+{amt}-{amt}*on/{n}"
+        x, y = center_x, center_y
+    elif style == "pan_left_to_right":
+        z = f"1+{amt}"
+        x = f"(iw-iw/zoom)*on/{n}"
+        y = center_y
+    elif style == "pan_right_to_left":
+        z = f"1+{amt}"
+        x = f"(iw-iw/zoom)*(1-on/{n})"
+        y = center_y
+    else:
+        raise ValueError(f"Unknown photo animation style: {style}")
+
+    vf = (
+        "scale=3840:2160:force_original_aspect_ratio=increase,"
+        "crop=3840:2160,"
+        "setsar=1,"
+        f"zoompan=z='{z}':x='{x}':y='{y}':"
+        f"d={total_frames}:s={WIDTH}x{HEIGHT}:fps={FPS},"
+        "format=yuv420p"
+    )
+
+    tmp_dest = f"{dest_path}.{uuid.uuid4().hex}.tmp.mp4"
+
+    try:
+        _run([
+            "ffmpeg",
+            "-y",
+            "-i", src_path,
+            "-vf", vf,
+            "-frames:v", str(total_frames),
+            "-c:v", "libx264",
+            "-preset", "superfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "main",
+            "-level:v", "4.1",
+            "-movflags", "+faststart",
+            "-an",
+            tmp_dest,
+        ])
+
+        os.replace(tmp_dest, dest_path)  # atomic rename
+    finally:
+        if os.path.exists(tmp_dest):
+            try:
+                os.remove(tmp_dest)
+            except Exception:
+                pass
+
+
 def _video_duration_frames(path: str) -> int:
     try:
         proc = _run([
@@ -311,10 +389,19 @@ def _try_video_asset(video: dict, asset_dir: str, video_id: str, label: str):
         return None
 
 
-def _try_photo_asset(photo: dict, asset_dir: str, video_id: str, label: str):
+def _try_photo_asset(
+    photo: dict,
+    asset_dir: str,
+    video_id: str,
+    label: str,
+    duration_sec: float = None,
+):
     """
-    Download a photo entry. Returns the asset dict, or None if it
-    could not be used.
+    Download a photo entry and animate it (zoom in / zoom out /
+    pan left->right / pan right->left) into an MP4.
+
+    Returns the asset dict, or None if it could not be used.
+    If the animation fails, falls back to the plain photo.
     """
     photo_item_id = photo.get("id")
     url = photo.get("image_url")
@@ -337,14 +424,43 @@ def _try_photo_asset(photo: dict, asset_dir: str, video_id: str, label: str):
         print(f"[photo] query: {photo.get('query', '')}")
         print(f"[photo] downloaded: {local_path}")
 
-        return {
-            "kind": "photo",
-            "path": f"render-assets/{video_id}/{filename}",
-        }
-
     except Exception as e:
         print(f"[warn] {label} photo download failed ({url}): {e}")
         return None
+
+    # ---- ANIMATE PHOTO ----
+    if duration_sec and duration_sec > 0:
+        style = random.choice(PHOTO_ANIMATIONS)
+        anim_filename = f"photo_{photo_item_id}_anim.mp4"
+        anim_path = os.path.join(asset_dir, anim_filename)
+
+        try:
+            _animate_photo(
+                local_path,
+                anim_path,
+                duration_sec + PHOTO_PAD_SECONDS,
+                style,
+            )
+
+            if not os.path.exists(anim_path):
+                raise RuntimeError(f"Animated photo was not created: {anim_path}")
+
+            print(f"[photo] animation: {style} -> {anim_path}")
+
+            return {
+                "kind": "video",
+                "duration_frames": _video_duration_frames(anim_path),
+                "path": f"render-assets/{video_id}/{anim_filename}",
+            }
+
+        except Exception as e:
+            print(f"[warn] photo animation failed, using plain photo: {e}")
+            _safe_remove(anim_path)
+
+    return {
+        "kind": "photo",
+        "path": f"render-assets/{video_id}/{filename}",
+    }
 
 
 def _pick_asset(direction: dict, video_id: str):
@@ -362,6 +478,12 @@ def _pick_asset(direction: dict, video_id: str):
         f"[media] selected_media_id={selected_media_id}, "
         f"selected_media_type={selected_media_type}"
     )
+
+    # Segment duration (seconds) -> used to length the photo animation
+    try:
+        segment_sec = float(direction.get("end", 0)) - float(direction.get("start", 0))
+    except (TypeError, ValueError):
+        segment_sec = 0.0
 
     # 3. ASSET DIRECTORY
     asset_dir = os.path.join(
@@ -398,7 +520,9 @@ def _pick_asset(direction: dict, video_id: str):
         if selected_photo is None:
             print(f"[warn] selected photo id={selected_media_id} not found in asserts")
         else:
-            result = _try_photo_asset(selected_photo, asset_dir, video_id, "selected")
+            result = _try_photo_asset(
+                selected_photo, asset_dir, video_id, "selected", segment_sec
+            )
             if result:
                 return result
 
@@ -411,7 +535,9 @@ def _pick_asset(direction: dict, video_id: str):
                 return result
 
         if photos:
-            result = _try_photo_asset(photos[0], asset_dir, video_id, "fallback selected")
+            result = _try_photo_asset(
+                photos[0], asset_dir, video_id, "fallback selected", segment_sec
+            )
             if result:
                 return result
 
@@ -1162,7 +1288,6 @@ def apply_custom_text_overlays(
                     f"animation={animation}"
                 )
 
-        # No overlays to apply.
         if not filters:
             print("[custom-text] No custom text overlays found")
             return video_path
@@ -1172,7 +1297,6 @@ def apply_custom_text_overlays(
             "output_custom_text.mp4",
         )
 
-        # Apply all overlays in a single FFmpeg pass.
         _run([
             "ffmpeg",
             "-y",
